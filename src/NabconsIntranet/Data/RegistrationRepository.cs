@@ -1,0 +1,173 @@
+using System.Text.RegularExpressions;
+using NabconsIntranet.Infrastructure;
+
+namespace NabconsIntranet.Data;
+
+public static class RegistrationStatus
+{
+    public const string Pending = "Pending";
+    public const string Approved = "Approved";
+    public const string Rejected = "Rejected";
+}
+
+public sealed class RegistrationRequest
+{
+    public long Id { get; set; }
+    public string Mobile { get; set; } = "";
+    public long? StaffId { get; set; }
+    public string? EmployeeCode { get; set; }
+    public string FullName { get; set; } = "";
+    public string? Designation { get; set; }
+    public string? Vertical { get; set; }
+    public string? Location { get; set; }
+    public string? OfficialEmail { get; set; }
+    public string? PasswordHash { get; set; }
+    public string Status { get; set; } = RegistrationStatus.Pending;
+    public string SubmittedAt { get; set; } = "";
+    public string? IpAddress { get; set; }
+    public string? DecidedBy { get; set; }
+    public string? DecidedAt { get; set; }
+    public string? DecisionRemarks { get; set; }
+    public long? CreatedUserId { get; set; }
+}
+
+/// <summary>
+/// Staff self-registration: a person registers with their 10-digit mobile number (which becomes their
+/// sign-in name); an administrator approves or rejects. Existing directory entries are matched by mobile.
+/// </summary>
+public sealed class RegistrationRepository(Db db, StaffRepository staff, UserRepository users, Fmt fmt, INotificationService notifications, ChangeTracker tracker)
+{
+    private static readonly Regex TenDigits = new(@"^\d{10}$", RegexOptions.Compiled);
+
+    public static bool IsValidMobile(string? m) => m != null && TenDigits.IsMatch(m);
+
+    /// <summary>Digits only; drops a leading +91/91/0 so "+91 98200 12345" and "098200 12345" both match "9820012345".</summary>
+    public static string? Normalize(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var d = new string(raw.Where(char.IsDigit).ToArray());
+        if (d.Length == 12 && d.StartsWith("91")) d = d[2..];
+        else if (d.Length == 11 && d.StartsWith('0')) d = d[1..];
+        return d.Length == 10 ? d : null;
+    }
+
+    public static string MaskEmail(string? email)
+    {
+        if (string.IsNullOrEmpty(email) || !email.Contains('@')) return "";
+        var at = email.IndexOf('@');
+        var local = email[..at];
+        var shown = local.Length <= 2 ? local[..1] : local[..1] + new string('*', Math.Min(local.Length - 2, 6)) + local[^1];
+        return shown + email[at..];
+    }
+
+    /// <summary>
+    /// Current directory entry whose mobile matches (formatting ignored). Entries of people who have left are
+    /// never matched, so approving a registration cannot silently bring back a retired entry (the administrator
+    /// can still add a new directory entry when approving).
+    /// </summary>
+    public StaffMember? FindStaffByMobile(string mobile) =>
+        staff.All().FirstOrDefault(s => Normalize(s.Mobile) == mobile && s.IsActive(fmt.Today));
+
+    public RegistrationRequest? Get(long id) => db.Single<RegistrationRequest>("SELECT * FROM RegistrationRequests WHERE Id = @id", new { id });
+
+    public RegistrationRequest? Latest(string mobile) =>
+        db.Single<RegistrationRequest>("SELECT * FROM RegistrationRequests WHERE Mobile = @mobile ORDER BY Id DESC LIMIT 1", new { mobile });
+
+    public bool HasPending(string mobile) =>
+        db.Scalar<long>("SELECT COUNT(*) FROM RegistrationRequests WHERE Mobile = @mobile AND Status = 'Pending'", new { mobile }) > 0;
+
+    public List<RegistrationRequest> List(string? status) => db.Query<RegistrationRequest>(
+        "SELECT * FROM RegistrationRequests" + (string.IsNullOrEmpty(status) ? "" : " WHERE Status = @status") + " ORDER BY Id DESC LIMIT 500",
+        new { status });
+
+    public long PendingCount() => db.Scalar<long>("SELECT COUNT(*) FROM RegistrationRequests WHERE Status = 'Pending'");
+
+    public long Submit(RegistrationRequest r)
+    {
+        r.Status = RegistrationStatus.Pending;
+        r.SubmittedAt = Db.Now();
+        using var c = db.Open();
+        using var tx = c.BeginTransaction();
+        r.Id = Db.Insert(c, tx, """
+            INSERT INTO RegistrationRequests (Mobile, StaffId, EmployeeCode, FullName, Designation, Vertical, Location, OfficialEmail, PasswordHash, Status, SubmittedAt, IpAddress)
+            VALUES (@Mobile, @StaffId, @EmployeeCode, @FullName, @Designation, @Vertical, @Location, @OfficialEmail, @PasswordHash, @Status, @SubmittedAt, @IpAddress)
+            """, r);
+        notifications.NotifyAdministrators(c, tx, new NotificationActor(0, r.FullName), new NotificationMessage("Admin.RegistrationPending",
+            $"Self-registration awaiting approval — {r.FullName}", string.Join(" · ", new[] { r.Designation, r.Vertical }.Where(x => !string.IsNullOrWhiteSpace(x))),
+            $"/Admin/RegistrationReview/{r.Id}", "Registration", r.Id));
+        tx.Commit();
+        tracker.Touch(ChangeTracker.AdminQueue);
+        return r.Id;
+    }
+
+    /// <summary>Creates the sign-in account (user name = mobile) and optionally updates or adds the directory entry.</summary>
+    public long Approve(RegistrationRequest r, IEnumerable<string> roles, bool updateDirectory, string? employeeCodeForNew, string actor)
+    {
+        if (users.GetByUsername(r.Mobile) != null) throw new WorkflowException($"A user account for {r.Mobile} already exists.");
+        // Claim the request first, so two administrators approving at the same moment cannot both create accounts.
+        var claimed = db.Exec("""
+            UPDATE RegistrationRequests SET Status = 'Approved', DecidedBy = @actor, DecidedAt = @now
+            WHERE Id = @Id AND Status = 'Pending'
+            """, new { actor, now = Db.Now(), r.Id });
+        if (claimed == 0) throw new WorkflowException("This registration was already decided by someone else.");
+        long userId;
+        try
+        {
+            userId = users.Create(new AppUser
+            {
+                Username = r.Mobile, DisplayName = r.FullName, Email = r.OfficialEmail, Vertical = r.Vertical,
+                Roles = Infrastructure.Roles.Join(roles), PasswordHash = r.PasswordHash, MustChangePassword = false, IsActive = true,
+            }, actor);
+        }
+        catch
+        {
+            // no account was made: put the request back in the queue
+            db.Exec("UPDATE RegistrationRequests SET Status = 'Pending', DecidedBy = NULL, DecidedAt = NULL WHERE Id = @Id AND CreatedUserId IS NULL", new { r.Id });
+            throw;
+        }
+
+        long? linkStaffId = null;
+        if (updateDirectory)
+        {
+            var existing = r.StaffId != null ? staff.Get(r.StaffId.Value) : null;
+            if (existing != null && !existing.IsActive(fmt.Today)) existing = null;   // never bring back the entry of someone who has left
+            if (existing != null)
+            {
+                existing.FullName = r.FullName;
+                existing.Designation = r.Designation;
+                existing.Vertical = r.Vertical;
+                existing.Location = r.Location;
+                if (!string.IsNullOrEmpty(r.OfficialEmail)) existing.OfficialEmail = r.OfficialEmail;
+                existing.ActiveTo = null; // a registered, approved person is current staff
+                staff.Upsert(existing, actor);
+                linkStaffId = existing.StaffId;
+            }
+            else if (!string.IsNullOrWhiteSpace(employeeCodeForNew))
+            {
+                staff.Upsert(new StaffMember
+                {
+                    EmployeeCode = employeeCodeForNew.Trim(), FullName = r.FullName, Designation = r.Designation, Vertical = r.Vertical,
+                    Location = r.Location, OfficialEmail = r.OfficialEmail, Mobile = r.Mobile, ShowMobile = false,
+                    ActiveFrom = fmt.Today.ToString("yyyy-MM-dd"),
+                }, actor);
+            }
+        }
+        if (linkStaffId == null && !string.IsNullOrWhiteSpace(employeeCodeForNew)) linkStaffId = staff.GetByCode(employeeCodeForNew.Trim())?.StaffId;
+        if (linkStaffId != null && db.Scalar<long>("SELECT COUNT(*) FROM Users WHERE StaffId = @linkStaffId", new { linkStaffId }) == 0)
+            db.Exec("UPDATE Users SET StaffId = @linkStaffId WHERE Id = @userId", new { linkStaffId, userId });
+
+        db.Exec("UPDATE RegistrationRequests SET CreatedUserId = @userId, PasswordHash = NULL WHERE Id = @Id", new { userId, r.Id });
+        tracker.Touch(ChangeTracker.AdminQueue);
+        return userId;
+    }
+
+    public void Reject(long id, string reason, string actor)
+    {
+        var n = db.Exec("""
+            UPDATE RegistrationRequests SET Status = 'Rejected', DecidedBy = @actor, DecidedAt = @now, DecisionRemarks = @reason, PasswordHash = NULL
+            WHERE Id = @id AND Status = 'Pending'
+            """, new { id, reason, actor, now = Db.Now() });
+        if (n == 0) throw new WorkflowException("This registration was already decided by someone else.");
+        tracker.Touch(ChangeTracker.AdminQueue);
+    }
+}

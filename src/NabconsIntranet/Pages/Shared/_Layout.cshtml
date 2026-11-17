@@ -1,0 +1,170 @@
+@inject UserRepository Users
+@inject LeadAccess LeadAccess
+@inject DeskService Desk
+@inject NotificationOptions NotifyOptions
+@inject ENoteOptions ENoteSettings
+@inject BoardOptions BoardSettings
+@inject ComplianceAccess ComplianceAccess
+@inject InwardAccess InwardAccess
+@{
+    var signedIn = User.Identity?.IsAuthenticated == true && User.UserId() > 0;
+    // All badge numbers come from one cached query (see DeskService); the page script refreshes them with a small poll.
+    var counts = signedIn ? Desk.Counts(User) : null;
+    var inbox = counts?.Inbox ?? 0;
+    var pendingRegs = counts?.AdminPending ?? 0;
+    var me = signedIn ? Users.Get(User.UserId()) : null;
+    var leadManager = signedIn && LeadAccess.CanManage(User);
+    var newLeads = counts?.NewLeads ?? 0;
+    var unread = counts?.Unread ?? 0;
+    var deskTotal = counts?.Total ?? 0;
+    var enotesPending = counts?.ENotesPending ?? 0;
+    var boardNew = counts?.BoardNew ?? 0;
+    var complianceN = counts?.Compliance ?? 0;
+    var showCompliance = signedIn && ComplianceAccess.ShowsMenu(User, counts?.ComplianceAssigned == true);
+    var inwardN = counts?.Inward ?? 0;
+    var showInward = signedIn && InwardAccess.ShowsMenu(User, counts?.InwardAssigned == true);
+    string Hide(long n) => n > 0 ? "" : "hidden";
+    var path = Context.Request.Path.Value ?? "/";
+    string Active(string prefix) => (prefix == "/" ? path == "/" : path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) ? "active" : "";
+    var title = ViewData["Title"] as string;
+}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@(string.IsNullOrEmpty(title) ? Site.SiteTitle : title + " · " + Site.SiteTitle)</title>
+    <link rel="icon" href="~/img/favicon.png" type="image/png" />
+    <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
+</head>
+<body data-poll="@(signedIn ? NotifyOptions.EffectivePollSeconds : 0)" data-poll-token="@counts?.Token">
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+        <div class="wrap topbar-inner">
+            <a class="brand" href="/">
+                <img src="~/img/nabcons-logo.png" alt="NABCONS logo" width="72" height="72" />
+                <span class="brand-text">
+                    <strong>@Site.SiteTitle</strong>
+                    <small>@Site.OrganisationName</small>
+                </span>
+            </a>
+            @if (signedIn)
+            {
+                <form class="topsearch" method="get" action="/Search" role="search">
+                    <input type="search" name="q" placeholder="Search staff, circulars…" aria-label="Search the intranet" maxlength="100" value="@(path.StartsWith("/Search") ? Context.Request.Query["q"].ToString() : "")" />
+                    <button type="submit" aria-label="Search">Search</button>
+                </form>
+                <details class="bell" id="bell">
+                    <summary id="bell-summary" aria-label="Notifications, @unread unread" title="Notifications">
+                        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false"><path d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5.5-6.84V3a1.5 1.5 0 0 0-3 0v1.16A7 7 0 0 0 5 11v5l-2 2v1h18v-1Z"/></svg>
+                        <span class="bell-count @Hide(unread)" data-badge="unread">@DeskCounts.Badge(unread)</span>
+                    </summary>
+                    <div class="menu bell-menu">
+                        <div class="bell-head">
+                            <strong>Notifications</strong>
+                            <form method="post" asp-page="/Notifications/Index" asp-page-handler="MarkAllRead">
+                                <input type="hidden" name="returnUrl" value="@(Context.Request.Path + Context.Request.QueryString)" />
+                                <button type="submit" class="linkbtn small">Mark all read</button>
+                            </form>
+                        </div>
+                        <div id="bell-list" class="bell-list" aria-live="polite"><p class="muted small pad">Your latest notifications are on the <a href="/Notifications">Notifications</a> page.</p></div>
+                        <a class="bell-all" href="/Notifications">View all notifications</a>
+                    </div>
+                </details>
+                <details class="usermenu">
+                    <summary>@if (me?.PhotoVersion > 0) { <img class="avatar-photo sm" src="/photo/@me.Id?thumb=true&v=@me.PhotoVersion" alt="" width="32" height="32" /> } else { <span class="avatar sm">@Fmt.Initials(User.DisplayName())</span> }<span class="uname">@User.DisplayName()</span></summary>
+                    <div class="menu">
+                        <div class="menu-head">
+                            <strong>@User.DisplayName()</strong>
+                            <small>@User.UserName()</small>
+                            <div class="chips">@foreach (var r in User.RoleNames()) { <span class="chip">@r</span> }</div>
+                        </div>
+                        <a href="/Profile">My Profile</a>
+                        @if (!Site.IsWindowsAuth)
+                        {
+                            <a href="/Account/ChangePassword">Change password</a>
+                            <form method="post" asp-page="/Account/Logout">
+                                <button type="submit" class="linkbtn">Sign out</button>
+                            </form>
+                        }
+                        else
+                        {
+                            <span class="muted small pad">Signed in with your Windows account</span>
+                        }
+                    </div>
+                </details>
+            }
+        </div>
+        @if (signedIn)
+        {
+            <nav class="mainnav" aria-label="Main">
+                <div class="wrap">
+                    <input type="checkbox" id="navtoggle" class="navtoggle" />
+                    <label for="navtoggle" class="navtoggle-label">☰ Menu</label>
+                    <ul>
+                        <li><a class="@Active("/")" href="/">Home</a></li>
+                        <li><a class="@Active("/Desk")" href="/Desk">My Desk <span class="count @Hide(deskTotal)" data-badge="desk" title="Items waiting for your action">@DeskCounts.Badge(deskTotal)</span></a></li>
+                        @if (ENoteSettings.Enabled)
+                        {
+                            <li><a class="@Active("/ENotes")" href="/ENotes">e-Notes <span class="count @Hide(enotesPending)" data-badge="enotes" title="e-Notes pending with you">@DeskCounts.Badge(enotesPending)</span></a></li>
+                        }
+                        @if (BoardSettings.Enabled)
+                        {
+                            <li><a class="@Active("/Board")" href="/Board">Message Board <span class="count @Hide(boardNew)" data-badge="board" title="New posts since your last visit">@DeskCounts.Badge(boardNew)</span></a></li>
+                        }
+                        <li><a class="@Active("/Directory")" href="/Directory">Staff Directory</a></li>
+                        <li><a class="@Active("/Circulars")" href="/Circulars">Circulars</a></li>
+                        <li><a class="@(path.StartsWith("/Requests") && !path.StartsWith("/Requests/Inbox") ? "active" : "")" href="/Requests">My Requests</a></li>
+                        <li><a class="@Active("/Leads")" href="@(leadManager ? "/Leads" : "/Leads/Mine")">Business Leads @if (leadManager) { <span class="count @Hide(newLeads)" data-badge="leads" title="Leads still in Submitted">@DeskCounts.Badge(newLeads)</span> }</a></li>
+                        @if (showCompliance)
+                        {
+                            <li><a class="@Active("/Compliance")" href="@(ComplianceAccess.SeesAll(User) ? "/Compliance" : "/Compliance/Mine")">Compliance <span class="count @Hide(complianceN)" data-badge="compliance" title="Compliance items waiting for you">@DeskCounts.Badge(complianceN)</span></a></li>
+                        }
+                        @if (showInward)
+                        {
+                            <li><a class="@Active("/Inward")" href="@(InwardAccess.SeesRegister(User) ? "/Inward" : "/Inward/Mine")">Inward <span class="count @Hide(inwardN)" data-badge="inward" title="Inward items waiting for you">@DeskCounts.Badge(inwardN)</span></a></li>
+                        }
+                        @if (User.IsApprover())
+                        {
+                            <li><a class="@Active("/Requests/Inbox")" href="/Requests/Inbox">Approval Inbox <span class="count @Hide(inbox)" data-badge="inbox">@DeskCounts.Badge(inbox)</span></a></li>
+                        }
+                        @if (User.IsPublisher())
+                        {
+                            <li><a class="@Active("/Notices")" href="/Notices">Notices</a></li>
+                        }
+                        @if (User.CanViewAudit())
+                        {
+                            <li><a class="@Active("/Audit")" href="/Audit">Audit</a></li>
+                        }
+                        @if (User.IsAdmin())
+                        {
+                            <li><a class="@Active("/Admin")" href="/Admin">Administration <span class="count @Hide(pendingRegs)" data-badge="admin">@DeskCounts.Badge(pendingRegs)</span></a></li>
+                        }
+                    </ul>
+                </div>
+            </nav>
+        }
+    </header>
+
+    <main id="main" class="wrap main">
+        <div class="print-logo"><img src="~/img/nabcons-logo.png" alt="" /><strong>@Site.OrganisationName — @Site.SiteTitle</strong></div>
+        @if (TempData["Message"] is string msg)
+        {
+            <div class="alert success" role="status">@msg</div>
+        }
+        @if (TempData["Error"] is string err)
+        {
+            <div class="alert danger" role="alert">@err</div>
+        }
+        @RenderBody()
+    </main>
+
+    <footer class="footer">
+        <div class="wrap footer-inner">
+            <span class="footer-brand"><img src="~/img/nabcons-logo.png" alt="" width="34" height="34" /><span>@Site.FooterText</span></span>
+            <span>@Site.ShortName Intranet v@(typeof(Program).Assembly.GetName().Version?.ToString(3)) · LAN-only · no internet connection used</span>
+        </div>
+    </footer>
+    <script src="~/js/site.js" asp-append-version="true"></script>
+</body>
+</html>

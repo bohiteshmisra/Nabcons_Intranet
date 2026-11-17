@@ -1,0 +1,1104 @@
+namespace NabconsIntranet.Infrastructure;
+
+/// <summary>
+/// Database schema. Created automatically on first start. Approval history and the audit
+/// log are protected by triggers so that rows can never be edited or deleted.
+/// </summary>
+public static class Schema
+{
+    /// <summary>Latest schema version this program understands (1 + number of migrations).</summary>
+    public static int Version => Migrations.Length == 0 ? 1 : Migrations.Max(m => m.Version);
+
+    /// <summary>
+    /// Database upgrades, applied in order on start-up to existing databases (and to new ones after
+    /// the base schema below). RULES — so live data is never lost:
+    ///   * only ADD: new tables, new columns (with a DEFAULT), new indexes; never DROP or rename;
+    ///   * never edit or remove an entry once released; add a new one with the next version number;
+    ///   * each step runs in a transaction, after an automatic snapshot of the database.
+    /// Example: (2, "Add Phone to Notices", "ALTER TABLE Notices ADD COLUMN Phone TEXT;"),
+    /// </summary>
+    public static readonly (int Version, string Description, string Sql)[] Migrations =
+    {
+        (2, "Self-registration requests (v1.1.0)", """
+            CREATE TABLE IF NOT EXISTS RegistrationRequests (
+                Id INTEGER PRIMARY KEY,
+                Mobile TEXT NOT NULL,
+                StaffId INTEGER,
+                EmployeeCode TEXT,
+                FullName TEXT NOT NULL,
+                Designation TEXT,
+                Vertical TEXT,
+                Location TEXT,
+                OfficialEmail TEXT,
+                PasswordHash TEXT,
+                Status TEXT NOT NULL DEFAULT 'Pending',
+                SubmittedAt TEXT NOT NULL,
+                IpAddress TEXT,
+                DecidedBy TEXT,
+                DecidedAt TEXT,
+                DecisionRemarks TEXT,
+                CreatedUserId INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS IX_RegistrationRequests_Mobile ON RegistrationRequests(Mobile, Status);
+            """),
+        // Adds every state and union-territory capital to the office/location list of an EXISTING installation.
+        // Skips names already present (also "Mumbai (Head Office)"-style entries). On a brand-new database the
+        // list is still empty here, and the first-run setup adds the same capitals itself.
+        (3, "State and UT capitals added to office/location list (v1.1.1)", """
+            WITH c(Name, Ord) AS (VALUES
+                ('Agartala', 0),
+                ('Aizawl', 1),
+                ('Amaravati', 2),
+                ('Bengaluru', 3),
+                ('Bhopal', 4),
+                ('Bhubaneswar', 5),
+                ('Chandigarh', 6),
+                ('Chennai', 7),
+                ('Daman', 8),
+                ('Dehradun', 9),
+                ('Dispur', 10),
+                ('Gandhinagar', 11),
+                ('Gangtok', 12),
+                ('Hyderabad', 13),
+                ('Imphal', 14),
+                ('Itanagar', 15),
+                ('Jaipur', 16),
+                ('Jammu', 17),
+                ('Kavaratti', 18),
+                ('Kohima', 19),
+                ('Kolkata', 20),
+                ('Leh', 21),
+                ('Lucknow', 22),
+                ('Mumbai', 23),
+                ('New Delhi', 24),
+                ('Panaji', 25),
+                ('Patna', 26),
+                ('Puducherry', 27),
+                ('Raipur', 28),
+                ('Ranchi', 29),
+                ('Shillong', 30),
+                ('Shimla', 31),
+                ('Srinagar', 32),
+                ('Sri Vijaya Puram (Port Blair)', 33),
+                ('Thiruvananthapuram', 34)
+            )
+            INSERT INTO MasterItems (Type, Name, SortOrder, IsActive)
+            SELECT 'Location', c.Name, 100 + c.Ord, 1 FROM c
+            WHERE EXISTS (SELECT 1 FROM MasterItems WHERE Type = 'Location')
+              AND NOT EXISTS (SELECT 1 FROM MasterItems m WHERE m.Type = 'Location'
+                              AND (m.Name = c.Name COLLATE NOCASE OR m.Name LIKE c.Name || ' (%'));
+            """),
+        // v1.2.0: profile links/photos, vertical-change approvals, profile audit trail and the business-lead pipeline.
+        // Additive only. Master-list values are inserted only when missing.
+        (4, "Profiles, photos and business leads (v1.2.0)", """
+            ALTER TABLE Users ADD COLUMN StaffId INTEGER;
+            ALTER TABLE Users ADD COLUMN PhotoVersion INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX IF NOT EXISTS IX_Users_StaffId ON Users(StaffId);
+
+            CREATE TABLE IF NOT EXISTS ProfileChangeRequests (
+                Id INTEGER PRIMARY KEY,
+                UserId INTEGER NOT NULL,
+                StaffId INTEGER,
+                Field TEXT NOT NULL,
+                OldValue TEXT,
+                NewValue TEXT,
+                Status TEXT NOT NULL DEFAULT 'Pending',
+                RequestedAt TEXT NOT NULL,
+                DecidedBy TEXT,
+                DecidedAt TEXT,
+                DecisionRemarks TEXT
+            );
+            CREATE INDEX IF NOT EXISTS IX_ProfileChangeRequests_Status ON ProfileChangeRequests(Status, UserId);
+
+            CREATE TABLE IF NOT EXISTS ProfileAudit (
+                Id INTEGER PRIMARY KEY,
+                UserId INTEGER NOT NULL,
+                StaffId INTEGER,
+                Field TEXT NOT NULL,
+                OldValue TEXT,
+                NewValue TEXT,
+                ChangedBy TEXT NOT NULL,
+                ChangedAt TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS ProfileAudit_no_update BEFORE UPDATE ON ProfileAudit
+            BEGIN SELECT RAISE(ABORT, 'Profile audit is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ProfileAudit_no_delete BEFORE DELETE ON ProfileAudit
+            BEGIN SELECT RAISE(ABORT, 'Profile audit is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS LeadSerials (FinancialYear TEXT PRIMARY KEY, LastSerial INTEGER NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS Leads (
+                Id INTEGER PRIMARY KEY,
+                Reference TEXT NOT NULL UNIQUE,
+                FinancialYear TEXT NOT NULL,
+                Serial INTEGER NOT NULL,
+                Title TEXT NOT NULL,
+                ClientName TEXT NOT NULL,
+                ClientType TEXT,
+                Sector TEXT,
+                StateLocation TEXT,
+                Source TEXT,
+                EstimatedValueLakh REAL,
+                DueDate TEXT,
+                ContactName TEXT,
+                ContactDesignation TEXT,
+                ContactPhone TEXT,
+                ContactEmail TEXT,
+                Description TEXT NOT NULL,
+                TenderNumber TEXT,
+                Status TEXT NOT NULL,
+                OwnerUserId INTEGER,
+                SubmitterUserId INTEGER NOT NULL,
+                SubmitterName TEXT NOT NULL,
+                SubmitterVertical TEXT,
+                LossReason TEXT,
+                LossReasonText TEXT,
+                AwardedValueLakh REAL,
+                AwardDate TEXT,
+                RowVersion INTEGER NOT NULL DEFAULT 1,
+                CreatedAt TEXT NOT NULL,
+                UpdatedAt TEXT NOT NULL,
+                UNIQUE (FinancialYear, Serial)
+            );
+            CREATE INDEX IF NOT EXISTS IX_Leads_Submitter ON Leads(SubmitterUserId);
+            CREATE INDEX IF NOT EXISTS IX_Leads_Status ON Leads(Status);
+
+            CREATE TABLE IF NOT EXISTS LeadEvents (
+                Id INTEGER PRIMARY KEY,
+                LeadId INTEGER NOT NULL REFERENCES Leads(Id),
+                EventType TEXT NOT NULL,
+                FromStatus TEXT,
+                ToStatus TEXT,
+                Remarks TEXT,
+                Detail TEXT,
+                ActorUserId INTEGER NOT NULL,
+                ActorName TEXT NOT NULL,
+                Timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS IX_LeadEvents_Lead ON LeadEvents(LeadId);
+            CREATE TRIGGER IF NOT EXISTS LeadEvents_no_update BEFORE UPDATE ON LeadEvents
+            BEGIN SELECT RAISE(ABORT, 'Lead timeline is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS LeadEvents_no_delete BEFORE DELETE ON LeadEvents
+            BEGIN SELECT RAISE(ABORT, 'Lead timeline is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS LeadAttachments (
+                Id INTEGER PRIMARY KEY,
+                LeadId INTEGER NOT NULL REFERENCES Leads(Id),
+                Side TEXT NOT NULL,
+                StoredPath TEXT NOT NULL,
+                OriginalFileName TEXT NOT NULL,
+                ContentType TEXT NOT NULL,
+                SizeBytes INTEGER NOT NULL,
+                Sha256 TEXT NOT NULL,
+                UploadedByUserId INTEGER NOT NULL,
+                UploadedBy TEXT NOT NULL,
+                UploadedAt TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS IX_LeadAttachments_Lead ON LeadAttachments(LeadId);
+            CREATE TRIGGER IF NOT EXISTS LeadAttachments_no_delete BEFORE DELETE ON LeadAttachments
+            BEGIN SELECT RAISE(ABORT, 'Lead attachments cannot be deleted'); END;
+
+            WITH m(Type, Name, Ord) AS (VALUES
+                ('ClientType','Central Govt',1),('ClientType','State Govt',2),('ClientType','PSU',3),('ClientType','Bank/FI',4),
+                ('ClientType','Cooperative',5),('ClientType','NGO/Trust',6),('ClientType','Private',7),
+                ('ClientType','International/Multilateral',8),('ClientType','Other',9),
+                ('LeadSector','Agriculture & Allied',1),('LeadSector','Rural Infrastructure',2),('LeadSector','Climate Change & Environment',3),
+                ('LeadSector','Watershed & Natural Resources',4),('LeadSector','Financial Inclusion',5),('LeadSector','Microfinance & Livelihoods',6),
+                ('LeadSector','Cooperatives & FPOs',7),('LeadSector','Skill Development',8),('LeadSector','IT & Digital',9),
+                ('LeadSector','Impact Evaluation & Studies',10),('LeadSector','Capacity Building & Training',11),('LeadSector','Other',12),
+                ('LeadSource','Tender portal',1),('LeadSource','Client referral',2),('LeadSource','NABARD RO/HO',3),
+                ('LeadSource','Direct approach',4),('LeadSource','Repeat client',5),('LeadSource','Other',6),
+                ('LeadLossReason','Price',1),('LeadLossReason','Technical score',2),('LeadLossReason','Eligibility',3),
+                ('LeadLossReason','Client cancelled',4),('LeadLossReason','Not aligned',5),('LeadLossReason','Capacity',6),('LeadLossReason','Other',7)
+            )
+            INSERT INTO MasterItems (Type, Name, SortOrder, IsActive)
+            SELECT m.Type, m.Name, m.Ord, 1 FROM m
+            WHERE NOT EXISTS (SELECT 1 FROM MasterItems x WHERE x.Type = m.Type AND x.Name = m.Name COLLATE NOCASE);
+
+            INSERT INTO MasterItems (Type, Name, SortOrder, IsActive)
+            SELECT 'Vertical', 'BDU', 100, 1
+            WHERE EXISTS (SELECT 1 FROM MasterItems WHERE Type = 'Vertical')
+              AND NOT EXISTS (SELECT 1 FROM MasterItems WHERE Type = 'Vertical' AND Name = 'BDU' COLLATE NOCASE);
+            """),
+        // v1.3.0: in-app notifications, My Desk preference (and, in the same release, e-Note).
+        // Released in 1.3.0: never edit this entry; add a new one.
+        (5, "Notifications, My Desk and e-Note (v1.3.0)", """
+            ALTER TABLE Users ADD COLUMN OpenDeskAfterSignIn INTEGER NOT NULL DEFAULT 1;
+
+            CREATE TABLE IF NOT EXISTS Notifications (
+                Id INTEGER PRIMARY KEY,
+                UserId INTEGER NOT NULL REFERENCES Users(Id),
+                Type TEXT NOT NULL,
+                Title TEXT NOT NULL,
+                Message TEXT,
+                Link TEXT,
+                EntityType TEXT,
+                EntityId INTEGER,
+                ActorName TEXT,
+                CreatedAt TEXT NOT NULL,
+                ReadAt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS IX_Notifications_UserRead ON Notifications(UserId, ReadAt, CreatedAt DESC);
+            CREATE INDEX IF NOT EXISTS IX_Notifications_UserTime ON Notifications(UserId, CreatedAt DESC);
+            CREATE INDEX IF NOT EXISTS IX_Notifications_Created ON Notifications(CreatedAt);
+
+            CREATE INDEX IF NOT EXISTS IX_Leads_Owner ON Leads(OwnerUserId, Status, DueDate);
+            CREATE INDEX IF NOT EXISTS IX_Requests_SubmitterState ON Requests(SubmitterUserId, State);
+
+            -- e-Note: short code per vertical for note numbers (NCS/EN/<code>/<FY>/<serial>); empty = GEN
+            ALTER TABLE MasterItems ADD COLUMN Code TEXT;
+
+            CREATE TABLE IF NOT EXISTS ENoteSerials (
+                Code TEXT NOT NULL,
+                FinancialYear TEXT NOT NULL,
+                LastSerial INTEGER NOT NULL,
+                PRIMARY KEY (Code, FinancialYear)
+            );
+
+            CREATE TABLE IF NOT EXISTS ENotes (
+                Id INTEGER PRIMARY KEY,
+                NoteNumber TEXT UNIQUE,
+                NumberCode TEXT,
+                FinancialYear TEXT,
+                Serial INTEGER,
+                Subject TEXT NOT NULL,
+                Category TEXT,
+                InitiatorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                InitiatorName TEXT NOT NULL,
+                InitiatorDesignation TEXT,
+                InitiatorVertical TEXT,
+                CurrentHolderUserId INTEGER REFERENCES Users(Id),
+                CurrentHolderName TEXT,
+                PreviousHolderUserId INTEGER,
+                HeldSince TEXT,
+                State TEXT NOT NULL,
+                Outcome TEXT,
+                DraftBody TEXT,
+                CurrentBodyVersion INTEGER NOT NULL DEFAULT 0,
+                LastSeq INTEGER NOT NULL DEFAULT 0,
+                IsConfidential INTEGER NOT NULL DEFAULT 0,
+                DeclarationAccepted INTEGER NOT NULL DEFAULT 0,
+                CreatedAt TEXT NOT NULL,
+                SubmittedAt TEXT,
+                DecidedAt TEXT,
+                DecidedByUserId INTEGER,
+                DecidedByName TEXT,
+                DecidedByDesignation TEXT,
+                DecisionRemarks TEXT,
+                ClosedAt TEXT,
+                UpdatedAt TEXT NOT NULL,
+                RowVersion INTEGER NOT NULL DEFAULT 1,
+                PdfPath TEXT,
+                PdfSha256 TEXT,
+                PdfState TEXT,
+                RecordSha256 TEXT,
+                LastAgeingAlertOn TEXT,
+                UNIQUE (NumberCode, FinancialYear, Serial)
+            );
+            CREATE INDEX IF NOT EXISTS IX_ENotes_Holder ON ENotes(CurrentHolderUserId, State, HeldSince);
+            CREATE INDEX IF NOT EXISTS IX_ENotes_Initiator ON ENotes(InitiatorUserId, State, UpdatedAt);
+            CREATE INDEX IF NOT EXISTS IX_ENotes_Approved ON ENotes(Outcome, IsConfidential, DecidedAt);
+            CREATE INDEX IF NOT EXISTS IX_ENotes_StateTime ON ENotes(State, UpdatedAt);
+            CREATE INDEX IF NOT EXISTS IX_ENotes_Submitted ON ENotes(SubmittedAt);
+
+            CREATE TABLE IF NOT EXISTS ENoteBodyVersions (
+                Id INTEGER PRIMARY KEY,
+                NoteId INTEGER NOT NULL REFERENCES ENotes(Id),
+                Version INTEGER NOT NULL,
+                BodyText TEXT NOT NULL,
+                Sha256 TEXT NOT NULL,
+                CreatedByUserId INTEGER NOT NULL,
+                CreatedBy TEXT NOT NULL,
+                CreatedAt TEXT NOT NULL,
+                UNIQUE (NoteId, Version)
+            );
+            CREATE TRIGGER IF NOT EXISTS ENoteBodyVersions_no_update BEFORE UPDATE ON ENoteBodyVersions
+            BEGIN SELECT RAISE(ABORT, 'Submitted note text is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ENoteBodyVersions_no_delete BEFORE DELETE ON ENoteBodyVersions
+            BEGIN SELECT RAISE(ABORT, 'Submitted note text is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ENoteMovements (
+                Id INTEGER PRIMARY KEY,
+                NoteId INTEGER NOT NULL REFERENCES ENotes(Id),
+                Seq INTEGER NOT NULL,
+                Action TEXT NOT NULL,
+                FromUserId INTEGER,
+                FromName TEXT,
+                FromDesignation TEXT,
+                ToUserId INTEGER,
+                ToName TEXT,
+                ToDesignation TEXT,
+                FromState TEXT,
+                ToState TEXT NOT NULL,
+                Remarks TEXT,
+                Timestamp TEXT NOT NULL,
+                UNIQUE (NoteId, Seq)
+            );
+            CREATE INDEX IF NOT EXISTS IX_ENoteMovements_To ON ENoteMovements(ToUserId);
+            CREATE TRIGGER IF NOT EXISTS ENoteMovements_no_update BEFORE UPDATE ON ENoteMovements
+            BEGIN SELECT RAISE(ABORT, 'Note movements are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ENoteMovements_no_delete BEFORE DELETE ON ENoteMovements
+            BEGIN SELECT RAISE(ABORT, 'Note movements are append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ENoteComments (
+                Id INTEGER PRIMARY KEY,
+                NoteId INTEGER NOT NULL REFERENCES ENotes(Id),
+                Seq INTEGER NOT NULL,
+                AuthorUserId INTEGER NOT NULL,
+                AuthorName TEXT NOT NULL,
+                AuthorDesignation TEXT,
+                Text TEXT NOT NULL,
+                Timestamp TEXT NOT NULL,
+                UNIQUE (NoteId, Seq)
+            );
+            CREATE TRIGGER IF NOT EXISTS ENoteComments_no_update BEFORE UPDATE ON ENoteComments
+            BEGIN SELECT RAISE(ABORT, 'Note-sheet comments are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ENoteComments_no_delete BEFORE DELETE ON ENoteComments
+            BEGIN SELECT RAISE(ABORT, 'Note-sheet comments are append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ENoteAttachments (
+                Id INTEGER PRIMARY KEY,
+                NoteId INTEGER NOT NULL REFERENCES ENotes(Id),
+                StoredPath TEXT NOT NULL,
+                OriginalFileName TEXT NOT NULL,
+                ContentType TEXT NOT NULL,
+                SizeBytes INTEGER NOT NULL,
+                Sha256 TEXT NOT NULL,
+                UploadedByUserId INTEGER NOT NULL,
+                UploadedByName TEXT NOT NULL,
+                UploadedAt TEXT NOT NULL,
+                StageSeq INTEGER NOT NULL DEFAULT 0,
+                Stage TEXT,
+                SupersededById INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS IX_ENoteAttachments_Note ON ENoteAttachments(NoteId);
+            -- Only draft attachments (note never submitted) may be removed; afterwards they are append-only.
+            CREATE TRIGGER IF NOT EXISTS ENoteAttachments_no_delete BEFORE DELETE ON ENoteAttachments
+            WHEN (SELECT SubmittedAt FROM ENotes WHERE Id = old.NoteId) IS NOT NULL
+            BEGIN SELECT RAISE(ABORT, 'Attachments of a submitted note cannot be removed'); END;
+            -- The only change allowed: marking a file "superseded by" a newer one, once.
+            CREATE TRIGGER IF NOT EXISTS ENoteAttachments_no_update BEFORE UPDATE ON ENoteAttachments
+            WHEN NOT (old.SupersededById IS NULL AND new.SupersededById IS NOT NULL AND new.NoteId = old.NoteId
+                      AND new.StoredPath = old.StoredPath AND new.OriginalFileName = old.OriginalFileName AND new.ContentType = old.ContentType
+                      AND new.SizeBytes = old.SizeBytes AND new.Sha256 = old.Sha256 AND new.UploadedByUserId = old.UploadedByUserId
+                      AND new.UploadedByName = old.UploadedByName AND new.UploadedAt = old.UploadedAt AND new.StageSeq = old.StageSeq
+                      AND new.Stage IS old.Stage)
+            BEGIN SELECT RAISE(ABORT, 'Note attachments are append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ENoteParticipants (
+                NoteId INTEGER NOT NULL,
+                UserId INTEGER NOT NULL,
+                FirstInvolvedAt TEXT NOT NULL,
+                PRIMARY KEY (NoteId, UserId)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS IX_ENoteParticipants_User ON ENoteParticipants(UserId, NoteId);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS ENoteSearch USING fts5(
+                NoteNumber, Subject, Category, Body, content='', contentless_delete=1, tokenize='unicode61');
+
+            WITH m(Name, Ord) AS (VALUES ('General administration',1),('Finance & accounts',2),('Procurement',3),
+                ('HR (non-disciplinary)',4),('Projects & assignments',5),('IT',6),('Others',7))
+            INSERT INTO MasterItems (Type, Name, SortOrder, IsActive)
+            SELECT 'ENoteCategory', m.Name, m.Ord, 1 FROM m
+            WHERE NOT EXISTS (SELECT 1 FROM MasterItems x WHERE x.Type = 'ENoteCategory' AND x.Name = m.Name COLLATE NOCASE);
+            """),
+        // v1.4.0: message board (posts with photos, pinned by administrators). Additive only.
+        (6, "Message board (v1.4.0)", """
+            ALTER TABLE Users ADD COLUMN BoardSeenAt TEXT;
+
+            CREATE TABLE IF NOT EXISTS BoardPosts (
+                Id INTEGER PRIMARY KEY,
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                AuthorName TEXT NOT NULL,
+                AuthorDesignation TEXT,
+                AuthorVertical TEXT,
+                Body TEXT NOT NULL,
+                CreatedAt TEXT NOT NULL,
+                IsPinned INTEGER NOT NULL DEFAULT 0,
+                PinnedAt TEXT,
+                PinnedBy TEXT,
+                IsDeleted INTEGER NOT NULL DEFAULT 0,
+                DeletedAt TEXT,
+                DeletedBy TEXT,
+                DeleteReason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS IX_BoardPosts_List ON BoardPosts(IsDeleted, IsPinned, CreatedAt DESC);
+            CREATE INDEX IF NOT EXISTS IX_BoardPosts_Author ON BoardPosts(AuthorUserId, CreatedAt);
+
+            CREATE TABLE IF NOT EXISTS BoardPhotos (
+                Id INTEGER PRIMARY KEY,
+                PostId INTEGER NOT NULL REFERENCES BoardPosts(Id),
+                FileName TEXT NOT NULL,
+                Width INTEGER NOT NULL,
+                Height INTEGER NOT NULL,
+                SizeBytes INTEGER NOT NULL,
+                Sha256 TEXT NOT NULL,
+                SortOrder INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS IX_BoardPhotos_Post ON BoardPhotos(PostId, SortOrder);
+            -- posts are removed by hiding them (the record stays for the audit trail); rows are never deleted
+            CREATE TRIGGER IF NOT EXISTS BoardPosts_no_delete BEFORE DELETE ON BoardPosts
+            BEGIN SELECT RAISE(ABORT, 'Message board posts are hidden, not deleted'); END;
+            """),
+        // v1.6.0: compliance management (events, action points, updates, revisions, ATR snapshots). Additive only;
+        // registers only — no file is ever stored. Compliance access is held in ComplianceMembers, not in Users.Roles.
+        (7, "Compliance management (v1.6.0)", """
+            CREATE TABLE IF NOT EXISTS ComplianceSerials (FinancialYear TEXT PRIMARY KEY, LastSerial INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS ComplianceState (Key TEXT PRIMARY KEY, Value TEXT);
+
+            CREATE TABLE IF NOT EXISTS ComplianceMembers (
+                UserId INTEGER PRIMARY KEY REFERENCES Users(Id),
+                Role TEXT NOT NULL CHECK (Role IN ('ComplianceAdmin','ComplianceViewer')),
+                GrantedByName TEXT NOT NULL,
+                GrantedAt TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ComplianceMemberHistory (
+                Id INTEGER PRIMARY KEY,
+                UserId INTEGER NOT NULL,
+                Action TEXT NOT NULL,
+                Role TEXT,
+                ActorName TEXT NOT NULL,
+                At TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS ComplianceMemberHistory_no_update BEFORE UPDATE ON ComplianceMemberHistory BEGIN SELECT RAISE(ABORT, 'Compliance access history is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceMemberHistory_no_delete BEFORE DELETE ON ComplianceMemberHistory BEGIN SELECT RAISE(ABORT, 'Compliance access history is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ComplianceEvents (
+                Id INTEGER PRIMARY KEY,
+                SourceType TEXT NOT NULL,
+                ForumId INTEGER,
+                Forum TEXT NOT NULL CHECK (length(Forum) <= 150),
+                EventNo TEXT CHECK (length(EventNo) <= 60),
+                Title TEXT NOT NULL CHECK (length(Title) <= 300),
+                HeldOn TEXT,
+                PeriodFrom TEXT,
+                PeriodTo TEXT,
+                ReportReceivedOn TEXT,
+                ReportedTo TEXT CHECK (length(ReportedTo) <= 150),
+                ReportingCycle TEXT NOT NULL DEFAULT 'NextMeeting' CHECK (ReportingCycle IN ('NextMeeting','Quarterly','Monthly','OneTime')),
+                NextReportingOn TEXT,
+                IsConfidential INTEGER NOT NULL DEFAULT 0,
+                SourceKeptAt TEXT CHECK (length(SourceKeptAt) <= 300),
+                Remarks TEXT CHECK (length(Remarks) <= 1000),
+                CreatedByUserId INTEGER NOT NULL,
+                CreatedByName TEXT NOT NULL,
+                CreatedAt TEXT NOT NULL,
+                UpdatedAt TEXT NOT NULL,
+                RowVersion INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS IX_CEvents_Source ON ComplianceEvents(SourceType, HeldOn DESC);
+            CREATE INDEX IF NOT EXISTS IX_CEvents_Forum ON ComplianceEvents(ForumId, HeldOn DESC);
+            CREATE TRIGGER IF NOT EXISTS ComplianceEvents_no_delete BEFORE DELETE ON ComplianceEvents
+            BEGIN SELECT RAISE(ABORT, 'Compliance events are permanent records'); END;
+
+            CREATE TABLE IF NOT EXISTS CompliancePoints (
+                Id INTEGER PRIMARY KEY,
+                EventId INTEGER NOT NULL REFERENCES ComplianceEvents(Id),
+                Number TEXT NOT NULL UNIQUE,
+                FinancialYear TEXT NOT NULL,
+                Seq INTEGER NOT NULL DEFAULT 0,
+                RefNo TEXT CHECK (length(RefNo) <= 60),
+                RefSubject TEXT CHECK (length(RefSubject) <= 300),
+                PointText TEXT NOT NULL CHECK (length(PointText) <= 4000),
+                Category TEXT CHECK (length(Category) <= 150),
+                Priority TEXT NOT NULL DEFAULT 'Medium' CHECK (Priority IN ('High','Medium','Low')),
+                OwnerVertical TEXT CHECK (length(OwnerVertical) <= 150),
+                PrimaryOfficerUserId INTEGER NOT NULL REFERENCES Users(Id),
+                OfficerCode TEXT CHECK (length(OfficerCode) <= 30),
+                RaisedOn TEXT NOT NULL,
+                OriginalDueDate TEXT NOT NULL,
+                CurrentDueDate TEXT NOT NULL,
+                NextUpdateDue TEXT,
+                Amount REAL,
+                CarriedFromId INTEGER REFERENCES CompliancePoints(Id),
+                Status TEXT NOT NULL DEFAULT 'Ongoing' CHECK (Status IN ('Ongoing','PendingExternal','ProposedClosure','Completed','Dropped','Merged')),
+                AtrText TEXT CHECK (length(AtrText) <= 4000),
+                AtrAsOn TEXT,
+                PapersKeptAt TEXT CHECK (length(PapersKeptAt) <= 300),
+                PendingUpdateId INTEGER,
+                PendingRevisionId INTEGER,
+                LastReturnedAt TEXT,
+                ClosedAt TEXT,
+                ClosedByName TEXT,
+                ClosureRemarks TEXT CHECK (length(ClosureRemarks) <= 1000),
+                ClosureAuthority TEXT CHECK (length(ClosureAuthority) <= 300),
+                MergedIntoId INTEGER REFERENCES CompliancePoints(Id),
+                Reminded7For TEXT,
+                Reminded1For TEXT,
+                LastOverdueReminderOn TEXT,
+                UpdateRemindedFor TEXT,
+                CreatedByName TEXT NOT NULL,
+                CreatedAt TEXT NOT NULL,
+                UpdatedAt TEXT NOT NULL,
+                RowVersion INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS IX_CPoints_Event ON CompliancePoints(EventId, Seq, Id);
+            CREATE INDEX IF NOT EXISTS IX_CPoints_StatusDue ON CompliancePoints(Status, CurrentDueDate);
+            CREATE INDEX IF NOT EXISTS IX_CPoints_Officer ON CompliancePoints(PrimaryOfficerUserId, Status, CurrentDueDate);
+            CREATE INDEX IF NOT EXISTS IX_CPoints_Vertical ON CompliancePoints(OwnerVertical, Status);
+            CREATE INDEX IF NOT EXISTS IX_CPoints_Closed ON CompliancePoints(ClosedAt) WHERE ClosedAt IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS IX_CPoints_Carried ON CompliancePoints(CarriedFromId) WHERE CarriedFromId IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS IX_CPoints_PendingUpdate ON CompliancePoints(PendingUpdateId) WHERE PendingUpdateId IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS IX_CPoints_PendingRevision ON CompliancePoints(PendingRevisionId) WHERE PendingRevisionId IS NOT NULL;
+            CREATE TRIGGER IF NOT EXISTS CompliancePoints_fixed BEFORE UPDATE OF Number, FinancialYear, EventId, OriginalDueDate ON CompliancePoints
+            WHEN new.Number IS NOT old.Number OR new.FinancialYear IS NOT old.FinancialYear OR new.EventId IS NOT old.EventId OR new.OriginalDueDate IS NOT old.OriginalDueDate
+            BEGIN SELECT RAISE(ABORT, 'The number, event and original due date of an action point never change'); END;
+            CREATE TRIGGER IF NOT EXISTS CompliancePoints_no_delete BEFORE DELETE ON CompliancePoints
+            BEGIN SELECT RAISE(ABORT, 'Action points are permanent records'); END;
+
+            CREATE TABLE IF NOT EXISTS ComplianceSupportOfficers (
+                PointId INTEGER NOT NULL REFERENCES CompliancePoints(Id),
+                UserId INTEGER NOT NULL REFERENCES Users(Id),
+                PRIMARY KEY (PointId, UserId)
+            );
+            CREATE INDEX IF NOT EXISTS IX_CSupport_User ON ComplianceSupportOfficers(UserId, PointId);
+
+            CREATE TABLE IF NOT EXISTS ComplianceUpdates (
+                Id INTEGER PRIMARY KEY,
+                PointId INTEGER NOT NULL REFERENCES CompliancePoints(Id),
+                SubmittedByUserId INTEGER NOT NULL,
+                SubmittedByName TEXT NOT NULL,
+                SubmittedAt TEXT NOT NULL,
+                AsOn TEXT NOT NULL,
+                UpdateText TEXT NOT NULL CHECK (length(UpdateText) <= 4000),
+                ProposedStatus TEXT NOT NULL CHECK (ProposedStatus IN ('Ongoing','PendingExternal','ProposedClosure')),
+                PapersKeptAt TEXT CHECK (length(PapersKeptAt) <= 300),
+                ReviewState TEXT NOT NULL DEFAULT 'Pending' CHECK (ReviewState IN ('Pending','Accepted','Returned','Withdrawn','Superseded')),
+                ReviewedByUserId INTEGER,
+                ReviewedByName TEXT,
+                ReviewedAt TEXT,
+                ReviewRemarks TEXT CHECK (length(ReviewRemarks) <= 1000),
+                AtrText TEXT CHECK (length(AtrText) <= 4000)
+            );
+            CREATE INDEX IF NOT EXISTS IX_CUpdates_Point ON ComplianceUpdates(PointId, Id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS UX_CUpdates_Pending ON ComplianceUpdates(PointId) WHERE ReviewState = 'Pending';
+            CREATE TRIGGER IF NOT EXISTS ComplianceUpdates_guard BEFORE UPDATE ON ComplianceUpdates
+            WHEN old.ReviewState <> 'Pending' OR new.PointId IS NOT old.PointId OR new.SubmittedByUserId IS NOT old.SubmittedByUserId
+              OR new.SubmittedByName IS NOT old.SubmittedByName OR new.SubmittedAt IS NOT old.SubmittedAt OR new.AsOn IS NOT old.AsOn
+              OR new.UpdateText IS NOT old.UpdateText OR new.ProposedStatus IS NOT old.ProposedStatus OR new.PapersKeptAt IS NOT old.PapersKeptAt
+            BEGIN SELECT RAISE(ABORT, 'Compliance updates are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceUpdates_no_delete BEFORE DELETE ON ComplianceUpdates
+            BEGIN SELECT RAISE(ABORT, 'Compliance updates are append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ComplianceRevisions (
+                Id INTEGER PRIMARY KEY,
+                PointId INTEGER NOT NULL REFERENCES CompliancePoints(Id),
+                RequestedByUserId INTEGER NOT NULL,
+                RequestedByName TEXT NOT NULL,
+                RequestedAt TEXT NOT NULL,
+                OldDate TEXT NOT NULL,
+                NewDate TEXT NOT NULL,
+                Reason TEXT NOT NULL CHECK (length(Reason) <= 1000),
+                Status TEXT NOT NULL DEFAULT 'Pending' CHECK (Status IN ('Pending','Approved','Rejected','Withdrawn','Superseded')),
+                DecidedByUserId INTEGER,
+                DecidedByName TEXT,
+                DecidedAt TEXT,
+                DecisionRemarks TEXT CHECK (length(DecisionRemarks) <= 1000)
+            );
+            CREATE INDEX IF NOT EXISTS IX_CRevisions_Point ON ComplianceRevisions(PointId, Id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS UX_CRevisions_Pending ON ComplianceRevisions(PointId) WHERE Status = 'Pending';
+            CREATE TRIGGER IF NOT EXISTS ComplianceRevisions_guard BEFORE UPDATE ON ComplianceRevisions
+            WHEN old.Status <> 'Pending' OR new.PointId IS NOT old.PointId OR new.RequestedByUserId IS NOT old.RequestedByUserId
+              OR new.RequestedByName IS NOT old.RequestedByName OR new.RequestedAt IS NOT old.RequestedAt OR new.OldDate IS NOT old.OldDate
+              OR new.NewDate IS NOT old.NewDate OR new.Reason IS NOT old.Reason
+            BEGIN SELECT RAISE(ABORT, 'Due-date revisions are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceRevisions_no_delete BEFORE DELETE ON ComplianceRevisions
+            BEGIN SELECT RAISE(ABORT, 'Due-date revisions are append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ComplianceHistory (
+                Id INTEGER PRIMARY KEY,
+                PointId INTEGER,
+                EventId INTEGER,
+                At TEXT NOT NULL,
+                ActorUserId INTEGER,
+                ActorName TEXT NOT NULL,
+                Action TEXT NOT NULL,
+                FromStatus TEXT,
+                ToStatus TEXT,
+                Detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS IX_CHistory_Point ON ComplianceHistory(PointId, Id);
+            CREATE INDEX IF NOT EXISTS IX_CHistory_Event ON ComplianceHistory(EventId, At);
+            CREATE TRIGGER IF NOT EXISTS ComplianceHistory_no_update BEFORE UPDATE ON ComplianceHistory BEGIN SELECT RAISE(ABORT, 'Compliance history is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceHistory_no_delete BEFORE DELETE ON ComplianceHistory BEGIN SELECT RAISE(ABORT, 'Compliance history is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ComplianceImports (
+                Id INTEGER PRIMARY KEY,
+                EventId INTEGER NOT NULL,
+                Sha256 TEXT NOT NULL,
+                Rows INTEGER NOT NULL,
+                ImportedByName TEXT NOT NULL,
+                ImportedAt TEXT NOT NULL,
+                UNIQUE (EventId, Sha256)
+            );
+            CREATE TRIGGER IF NOT EXISTS ComplianceImports_no_update BEFORE UPDATE ON ComplianceImports BEGIN SELECT RAISE(ABORT, 'The import register is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceImports_no_delete BEFORE DELETE ON ComplianceImports BEGIN SELECT RAISE(ABORT, 'The import register is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ComplianceSnapshots (
+                Id INTEGER PRIMARY KEY,
+                Template TEXT NOT NULL,
+                ForumId INTEGER,
+                Forum TEXT NOT NULL,
+                Title TEXT NOT NULL,
+                SubmittedTo TEXT NOT NULL,
+                SubmittedOn TEXT NOT NULL,
+                AsOn TEXT NOT NULL,
+                OptionsJson TEXT NOT NULL,
+                HeaderJson TEXT NOT NULL,
+                ItemCount INTEGER NOT NULL,
+                Sha256 TEXT NOT NULL,
+                CreatedByUserId INTEGER NOT NULL,
+                CreatedByName TEXT NOT NULL,
+                CreatedAt TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS IX_CSnap_Forum ON ComplianceSnapshots(Template, ForumId, AsOn DESC);
+            CREATE TABLE IF NOT EXISTS ComplianceSnapshotEvents (
+                SnapshotId INTEGER NOT NULL,
+                EventId INTEGER NOT NULL,
+                PRIMARY KEY (SnapshotId, EventId)
+            );
+            CREATE INDEX IF NOT EXISTS IX_CSnapEvents_Event ON ComplianceSnapshotEvents(EventId);
+            CREATE TABLE IF NOT EXISTS ComplianceSnapshotItems (
+                SnapshotId INTEGER NOT NULL,
+                Seq INTEGER NOT NULL,
+                Section INTEGER NOT NULL,
+                PointId INTEGER,
+                Cells TEXT NOT NULL,
+                Bold INTEGER NOT NULL DEFAULT 0,
+                ReportedText TEXT,
+                Status TEXT,
+                PRIMARY KEY (SnapshotId, Seq)
+            );
+            CREATE INDEX IF NOT EXISTS IX_CSnapItems_Point ON ComplianceSnapshotItems(PointId, SnapshotId DESC) WHERE PointId IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS ComplianceSnapshotVoids (
+                SnapshotId INTEGER PRIMARY KEY,
+                Reason TEXT NOT NULL CHECK (length(Reason) <= 1000),
+                VoidedByName TEXT NOT NULL,
+                VoidedAt TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshots_no_update BEFORE UPDATE ON ComplianceSnapshots BEGIN SELECT RAISE(ABORT, 'ATR snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshots_no_delete BEFORE DELETE ON ComplianceSnapshots BEGIN SELECT RAISE(ABORT, 'ATR snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshotEvents_no_update BEFORE UPDATE ON ComplianceSnapshotEvents BEGIN SELECT RAISE(ABORT, 'ATR snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshotEvents_no_delete BEFORE DELETE ON ComplianceSnapshotEvents BEGIN SELECT RAISE(ABORT, 'ATR snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshotItems_no_update BEFORE UPDATE ON ComplianceSnapshotItems BEGIN SELECT RAISE(ABORT, 'ATR snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshotItems_no_delete BEFORE DELETE ON ComplianceSnapshotItems BEGIN SELECT RAISE(ABORT, 'ATR snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshotVoids_no_update BEFORE UPDATE ON ComplianceSnapshotVoids BEGIN SELECT RAISE(ABORT, 'Snapshot voids are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ComplianceSnapshotVoids_no_delete BEFORE DELETE ON ComplianceSnapshotVoids BEGIN SELECT RAISE(ABORT, 'Snapshot voids are append-only'); END;
+
+            WITH m(Name, Ord) AS (VALUES ('Board of Directors',1),('Audit Committee',2),('Business Development Committee',3),('HR Committee',4),('Risk Management Committee',5),('NABARD (Inspection)',6),('C&AG',7),('Statutory Auditor',8),('Internal Auditor',9),('Subsidiaries Review Meeting',10),('Strategic Review Meeting',11),('NABARD Oversight Review',12))
+            INSERT INTO MasterItems (Type, Name, SortOrder, IsActive)
+            SELECT 'ComplianceForum', m.Name, m.Ord, 1 FROM m
+            WHERE NOT EXISTS (SELECT 1 FROM MasterItems x WHERE x.Type = 'ComplianceForum' AND x.Name = m.Name COLLATE NOCASE);
+
+            WITH m(Name, Ord) AS (VALUES ('Governance',1),('Finance & Accounts',2),('Taxation',3),('Human Resources',4),('IT & Systems',5),('Business Development',6),('Legal & Statutory',7),('Administration',8),('Other',9))
+            INSERT INTO MasterItems (Type, Name, SortOrder, IsActive)
+            SELECT 'ComplianceCategory', m.Name, m.Ord, 1 FROM m
+            WHERE NOT EXISTS (SELECT 1 FROM MasterItems x WHERE x.Type = 'ComplianceCategory' AND x.Name = m.Name COLLATE NOCASE);
+            """),
+        // v1.7.0: inward register with invoice inward and tracking (DD-08). Additive only; registers only — no file is stored.
+        (8, "Inward register and invoices (v1.7.0)", """
+            ALTER TABLE ENotes ADD COLUMN SourceInwardId INTEGER DEFAULT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS UX_ENotes_SourceInward ON ENotes(SourceInwardId) WHERE SourceInwardId IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS InwardSerials (OfficeCode TEXT NOT NULL, FinancialYear TEXT NOT NULL, LastSerial INTEGER NOT NULL, PRIMARY KEY (OfficeCode, FinancialYear));
+            CREATE TABLE IF NOT EXISTS InwardState (Key TEXT PRIMARY KEY, Value TEXT);
+
+            CREATE TABLE IF NOT EXISTS InwardMembers (
+                Id INTEGER PRIMARY KEY,
+                UserId INTEGER NOT NULL REFERENCES Users(Id),
+                Role TEXT NOT NULL,
+                OfficeId INTEGER NOT NULL DEFAULT 0,
+                GrantedByName TEXT NOT NULL,
+                GrantedAt TEXT NOT NULL,
+                CHECK ((Role = 'InwardOperator') = (OfficeId > 0)),
+                UNIQUE (UserId, Role, OfficeId)
+            );
+            CREATE TABLE IF NOT EXISTS InwardMemberHistory (
+                Id INTEGER PRIMARY KEY, UserId INTEGER NOT NULL, Action TEXT NOT NULL, Role TEXT, OfficeId INTEGER, ActorName TEXT NOT NULL, At TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS InwardMemberHistory_no_update BEFORE UPDATE ON InwardMemberHistory BEGIN SELECT RAISE(ABORT, 'Inward access history is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardMemberHistory_no_delete BEFORE DELETE ON InwardMemberHistory BEGIN SELECT RAISE(ABORT, 'Inward access history is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS InwardItems (
+                Id INTEGER PRIMARY KEY,
+                Number TEXT NOT NULL UNIQUE,
+                OfficeId INTEGER NOT NULL,
+                OfficeName TEXT NOT NULL,
+                OfficeCode TEXT NOT NULL,
+                FinancialYear TEXT NOT NULL,
+                Serial INTEGER NOT NULL,
+                ItemType TEXT NOT NULL,
+                Mode TEXT NOT NULL,
+                ReceivedAt TEXT NOT NULL,
+                SenderName TEXT NOT NULL CHECK (length(SenderName) <= 150),
+                SenderOrg TEXT CHECK (length(SenderOrg) <= 200),
+                SenderRef TEXT CHECK (length(SenderRef) <= 100),
+                SenderRefDate TEXT,
+                Subject TEXT NOT NULL CHECK (length(Subject) <= 300),
+                Summary TEXT CHECK (length(Summary) <= 2000),
+                Category TEXT CHECK (length(Category) <= 150),
+                Priority TEXT NOT NULL DEFAULT 'Normal',
+                IsConfidential INTEGER NOT NULL DEFAULT 0,
+                ActionRequired TEXT NOT NULL,
+                ReplyDueOn TEXT,
+                KeptAt TEXT NOT NULL CHECK (length(KeptAt) <= 300),
+                Pages INTEGER CHECK (Pages IS NULL OR Pages BETWEEN 0 AND 10000),
+                Irn TEXT CHECK (length(Irn) <= 64),
+                Status TEXT NOT NULL,
+                HolderUserId INTEGER,
+                HolderSince TEXT,
+                AcceptedAt TEXT,
+                LastHolderUserId INTEGER,
+                InwardedByUserId INTEGER NOT NULL,
+                InwardedByName TEXT NOT NULL,
+                InwardedAt TEXT NOT NULL,
+                SelfInward INTEGER NOT NULL DEFAULT 0,
+                ClosureType TEXT,
+                ClosureRemarks TEXT CHECK (length(ClosureRemarks) <= 1000),
+                ReplyDate TEXT,
+                OutwardRef TEXT CHECK (length(OutwardRef) <= 100),
+                FiledFileNo TEXT CHECK (length(FiledFileNo) <= 100),
+                ForwardedTo TEXT CHECK (length(ForwardedTo) <= 200),
+                DuplicateOfId INTEGER,
+                ENoteId INTEGER,
+                ClosedAt TEXT,
+                ClosedByName TEXT,
+                LinkedToId INTEGER,
+                ReminderCount INTEGER NOT NULL DEFAULT 0,
+                LastDueReminderOn TEXT,
+                LastOverdueReminderOn TEXT,
+                RowVersion INTEGER NOT NULL DEFAULT 1,
+                UpdatedAt TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS IX_Inward_OfficeReceived ON InwardItems(OfficeId, ReceivedAt DESC);
+            CREATE INDEX IF NOT EXISTS IX_Inward_Holder ON InwardItems(HolderUserId, Status);
+            CREATE INDEX IF NOT EXISTS IX_Inward_StatusDue ON InwardItems(Status, ReplyDueOn);
+            CREATE INDEX IF NOT EXISTS IX_Inward_StatusOffice ON InwardItems(Status, OfficeId, InwardedAt);
+            CREATE INDEX IF NOT EXISTS IX_Inward_InwardedAt ON InwardItems(InwardedAt);
+            CREATE INDEX IF NOT EXISTS IX_Inward_ReceivedAt ON InwardItems(ReceivedAt);
+            CREATE INDEX IF NOT EXISTS IX_Inward_InwardedBy ON InwardItems(InwardedByUserId, Id);
+            CREATE INDEX IF NOT EXISTS IX_Inward_Closed ON InwardItems(ClosedAt) WHERE ClosedAt IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS IX_Inward_Linked ON InwardItems(LinkedToId) WHERE LinkedToId IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS IX_Inward_Type ON InwardItems(ItemType, Status);
+            CREATE INDEX IF NOT EXISTS IX_Inward_SenderRef ON InwardItems(SenderRef COLLATE NOCASE, SenderRefDate) WHERE SenderRef IS NOT NULL;
+            CREATE TRIGGER IF NOT EXISTS InwardItems_fixed BEFORE UPDATE ON InwardItems
+            WHEN new.Number IS NOT old.Number OR new.OfficeId IS NOT old.OfficeId OR new.OfficeCode IS NOT old.OfficeCode OR new.FinancialYear IS NOT old.FinancialYear OR new.Serial IS NOT old.Serial OR new.InwardedAt IS NOT old.InwardedAt OR new.InwardedByUserId IS NOT old.InwardedByUserId
+            BEGIN SELECT RAISE(ABORT, 'The number, office, FY and inwarding details of an inward item never change'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardItems_no_delete BEFORE DELETE ON InwardItems
+            BEGIN SELECT RAISE(ABORT, 'Inward items are permanent records'); END;
+
+            CREATE TABLE IF NOT EXISTS InwardParticipants (ItemId INTEGER NOT NULL, UserId INTEGER NOT NULL, PRIMARY KEY (ItemId, UserId)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS IX_InwardParticipants_User ON InwardParticipants(UserId, ItemId);
+
+            CREATE TABLE IF NOT EXISTS InwardMovements (
+                Id INTEGER PRIMARY KEY, ItemId INTEGER NOT NULL, At TEXT NOT NULL, ActorUserId INTEGER, ActorName TEXT NOT NULL,
+                Action TEXT NOT NULL, ToUserId INTEGER, ToName TEXT, Remarks TEXT CHECK (length(Remarks) <= 1000)
+            );
+            CREATE INDEX IF NOT EXISTS IX_InwardMovements_Item ON InwardMovements(ItemId, Id);
+            CREATE TABLE IF NOT EXISTS InwardCopies (ItemId INTEGER NOT NULL, UserId INTEGER NOT NULL, AddedAt TEXT NOT NULL, AddedByName TEXT NOT NULL, PRIMARY KEY (ItemId, UserId));
+            CREATE INDEX IF NOT EXISTS IX_InwardCopies_User ON InwardCopies(UserId, ItemId);
+            CREATE TABLE IF NOT EXISTS InwardNotes (
+                Id INTEGER PRIMARY KEY, ItemId INTEGER NOT NULL, At TEXT NOT NULL, UserId INTEGER NOT NULL, Name TEXT NOT NULL,
+                Text TEXT NOT NULL CHECK (length(Text) <= 2000)
+            );
+            CREATE INDEX IF NOT EXISTS IX_InwardNotes_Item ON InwardNotes(ItemId, Id);
+            CREATE TRIGGER IF NOT EXISTS InwardMovements_no_update BEFORE UPDATE ON InwardMovements BEGIN SELECT RAISE(ABORT, 'The inward movement trail is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardMovements_no_delete BEFORE DELETE ON InwardMovements BEGIN SELECT RAISE(ABORT, 'The inward movement trail is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardCopies_no_update BEFORE UPDATE ON InwardCopies BEGIN SELECT RAISE(ABORT, 'Inward copies are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardCopies_no_delete BEFORE DELETE ON InwardCopies BEGIN SELECT RAISE(ABORT, 'Inward copies are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardNotes_no_update BEFORE UPDATE ON InwardNotes BEGIN SELECT RAISE(ABORT, 'Inward notes are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardNotes_no_delete BEFORE DELETE ON InwardNotes BEGIN SELECT RAISE(ABORT, 'Inward notes are append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS ProjectCodes (
+                Code TEXT PRIMARY KEY COLLATE NOCASE, Name TEXT NOT NULL CHECK (length(Name) <= 200), OwnerUserId INTEGER,
+                IsActive INTEGER NOT NULL DEFAULT 1, UpdatedAt TEXT NOT NULL, UpdatedBy TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS InvoiceDetails (
+                ItemId INTEGER PRIMARY KEY REFERENCES InwardItems(Id),
+                VendorName TEXT NOT NULL CHECK (length(VendorName) <= 200),
+                VendorGstin TEXT,
+                IsMsme INTEGER NOT NULL DEFAULT 0,
+                IsTrader INTEGER NOT NULL DEFAULT 0,
+                UdyamNo TEXT CHECK (length(UdyamNo) <= 30),
+                MsmeClass TEXT,
+                InvoiceNo TEXT NOT NULL CHECK (length(InvoiceNo) <= 50),
+                InvoiceDate TEXT NOT NULL,
+                InvoiceFy TEXT NOT NULL,
+                ProjectCode TEXT,
+                PoRef TEXT CHECK (length(PoRef) <= 100),
+                TaxablePaise INTEGER CHECK (TaxablePaise IS NULL OR TaxablePaise >= 0),
+                GstPaise INTEGER CHECK (GstPaise IS NULL OR GstPaise >= 0),
+                OtherPaise INTEGER CHECK (OtherPaise IS NULL OR OtherPaise >= 0),
+                TotalPaise INTEGER NOT NULL CHECK (TotalPaise > 0),
+                AdjustPaise INTEGER NOT NULL DEFAULT 0,
+                SettledPaise INTEGER NOT NULL DEFAULT 0,
+                TermsDays INTEGER NOT NULL DEFAULT 30 CHECK (TermsDays BETWEEN 0 AND 365),
+                PaymentDueOn TEXT NOT NULL,
+                InvoiceStatus TEXT NOT NULL,
+                HoldFromStatus TEXT,
+                StatusReason TEXT CHECK (length(StatusReason) <= 1000),
+                CertifiedByUserId INTEGER,
+                CertifiedByName TEXT,
+                CertifiedOn TEXT,
+                SentToAccountsAt TEXT,
+                SettledAt TEXT,
+                DupKey TEXT NOT NULL,
+                OverrideReason TEXT CHECK (length(OverrideReason) <= 500),
+                DuplicateCheckedBy TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS UX_Invoice_Dup ON InvoiceDetails(DupKey) WHERE OverrideReason IS NULL AND InvoiceStatus <> 'Cancelled';
+            CREATE INDEX IF NOT EXISTS IX_Invoice_Key ON InvoiceDetails(DupKey);
+            CREATE INDEX IF NOT EXISTS IX_Invoice_Status ON InvoiceDetails(InvoiceStatus, InvoiceDate);
+            CREATE INDEX IF NOT EXISTS IX_Invoice_Project ON InvoiceDetails(ProjectCode, InvoiceStatus);
+            CREATE INDEX IF NOT EXISTS IX_Invoice_Gstin ON InvoiceDetails(VendorGstin, InvoiceDate);
+            CREATE INDEX IF NOT EXISTS IX_Invoice_Msme ON InvoiceDetails(IsMsme, InvoiceStatus, InvoiceDate);
+
+            CREATE TABLE IF NOT EXISTS InvoicePayments (
+                Id INTEGER PRIMARY KEY,
+                ItemId INTEGER NOT NULL,
+                PaidOn TEXT NOT NULL,
+                NetPaise INTEGER NOT NULL,
+                TdsPaise INTEGER NOT NULL DEFAULT 0,
+                OtherDeductionsPaise INTEGER NOT NULL DEFAULT 0,
+                VoucherRef TEXT NOT NULL CHECK (length(VoucherRef) <= 60),
+                ReversesId INTEGER UNIQUE,
+                Remarks TEXT CHECK (length(Remarks) <= 500),
+                Source TEXT NOT NULL,
+                EnteredByUserId INTEGER NOT NULL,
+                EnteredByName TEXT NOT NULL,
+                EnteredAt TEXT NOT NULL,
+                CHECK ((Source = 'Reversal') = (ReversesId IS NOT NULL)),
+                CHECK ((ReversesId IS NULL AND NetPaise >= 0 AND TdsPaise >= 0 AND OtherDeductionsPaise >= 0 AND NetPaise + TdsPaise + OtherDeductionsPaise > 0)
+                    OR (ReversesId IS NOT NULL AND NetPaise <= 0 AND TdsPaise <= 0 AND OtherDeductionsPaise <= 0))
+            );
+            CREATE INDEX IF NOT EXISTS IX_InvoicePayments_Item ON InvoicePayments(ItemId, Id);
+            CREATE INDEX IF NOT EXISTS IX_InvoicePayments_Voucher ON InvoicePayments(ItemId, VoucherRef);
+            CREATE TABLE IF NOT EXISTS InvoiceAdjustments (
+                Id INTEGER PRIMARY KEY, ItemId INTEGER NOT NULL, Kind TEXT NOT NULL,
+                DocNo TEXT NOT NULL CHECK (length(DocNo) <= 50), DocDate TEXT NOT NULL, AmountPaise INTEGER NOT NULL CHECK (AmountPaise > 0),
+                Remarks TEXT CHECK (length(Remarks) <= 500), EnteredByUserId INTEGER NOT NULL, EnteredByName TEXT NOT NULL, EnteredAt TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS IX_InvoiceAdjustments_Item ON InvoiceAdjustments(ItemId, Id);
+            CREATE TRIGGER IF NOT EXISTS InvoicePayments_no_update BEFORE UPDATE ON InvoicePayments BEGIN SELECT RAISE(ABORT, 'Invoice payments are append-only (reverse a payment instead)'); END;
+            CREATE TRIGGER IF NOT EXISTS InvoicePayments_no_delete BEFORE DELETE ON InvoicePayments BEGIN SELECT RAISE(ABORT, 'Invoice payments are append-only (reverse a payment instead)'); END;
+            CREATE TRIGGER IF NOT EXISTS InvoiceAdjustments_no_update BEFORE UPDATE ON InvoiceAdjustments BEGIN SELECT RAISE(ABORT, 'Invoice adjustments are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InvoiceAdjustments_no_delete BEFORE DELETE ON InvoiceAdjustments BEGIN SELECT RAISE(ABORT, 'Invoice adjustments are append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS InwardImports (Id INTEGER PRIMARY KEY, Kind TEXT NOT NULL, Sha256 TEXT NOT NULL, Rows INTEGER NOT NULL, ByName TEXT NOT NULL, At TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS IX_InwardImports_Sha ON InwardImports(Kind, Sha256);
+            CREATE TRIGGER IF NOT EXISTS InwardImports_no_update BEFORE UPDATE ON InwardImports BEGIN SELECT RAISE(ABORT, 'The import register is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS InwardImports_no_delete BEFORE DELETE ON InwardImports BEGIN SELECT RAISE(ABORT, 'The import register is append-only'); END;
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS InwardSearch USING fts5(
+                Number, Sender, SenderRef, Subject, Summary, Vendor, InvoiceNo, content='', contentless_delete=1, tokenize='unicode61');
+
+            WITH m(Name, Ord) AS (VALUES ('General correspondence',1),('Client / project',2),('Government / regulator',3),('Legal',4),('Finance & accounts',5),('Human resources',6),('Tenders & procurement',7),('Other',8))
+            INSERT INTO MasterItems (Type, Name, SortOrder, IsActive)
+            SELECT 'InwardCategory', m.Name, m.Ord, 1 FROM m
+            WHERE NOT EXISTS (SELECT 1 FROM MasterItems x WHERE x.Type = 'InwardCategory' AND x.Name = m.Name COLLATE NOCASE);
+            """),
+    };
+
+    public const string Sql = """
+CREATE TABLE IF NOT EXISTS SchemaInfo (Version INTEGER NOT NULL, AppliedAt TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS Users (
+    Id INTEGER PRIMARY KEY,
+    Username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    DisplayName TEXT NOT NULL,
+    Email TEXT,
+    Vertical TEXT,
+    Roles TEXT NOT NULL DEFAULT 'Staff',
+    PasswordHash TEXT,
+    MustChangePassword INTEGER NOT NULL DEFAULT 0,
+    FailedLogins INTEGER NOT NULL DEFAULT 0,
+    LockoutUntil TEXT,
+    IsActive INTEGER NOT NULL DEFAULT 1,
+    SecurityStamp TEXT NOT NULL,
+    LastLoginAt TEXT,
+    CreatedAt TEXT NOT NULL,
+    UpdatedBy TEXT,
+    UpdatedAt TEXT
+);
+
+CREATE TABLE IF NOT EXISTS MasterItems (
+    Id INTEGER PRIMARY KEY,
+    Type TEXT NOT NULL,
+    Name TEXT NOT NULL,
+    SortOrder INTEGER NOT NULL DEFAULT 0,
+    IsActive INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (Type, Name COLLATE NOCASE)
+);
+
+CREATE TABLE IF NOT EXISTS Staff (
+    StaffId INTEGER PRIMARY KEY,
+    EmployeeCode TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    FullName TEXT NOT NULL,
+    Designation TEXT,
+    Vertical TEXT,
+    Location TEXT,
+    OfficialEmail TEXT,
+    Extension TEXT,
+    Mobile TEXT,
+    ShowMobile INTEGER NOT NULL DEFAULT 0,
+    PhotographPath TEXT,
+    ActiveFrom TEXT,
+    ActiveTo TEXT,
+    UpdatedBy TEXT,
+    UpdatedAt TEXT
+);
+CREATE INDEX IF NOT EXISTS IX_Staff_Name ON Staff(FullName);
+
+CREATE TABLE IF NOT EXISTS Circulars (
+    Id INTEGER PRIMARY KEY,
+    CircularNumber TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    Title TEXT NOT NULL,
+    Category TEXT NOT NULL,
+    IssuingVertical TEXT,
+    IssueDate TEXT NOT NULL,
+    EffectiveDate TEXT,
+    Keywords TEXT,
+    Synopsis TEXT,
+    Visibility TEXT NOT NULL DEFAULT 'AllStaff',
+    Status TEXT NOT NULL DEFAULT 'Draft',
+    SupersedesId INTEGER REFERENCES Circulars(Id),
+    SupersededById INTEGER REFERENCES Circulars(Id),
+    CurrentVersion INTEGER NOT NULL DEFAULT 0,
+    CreatedBy TEXT NOT NULL,
+    CreatedAt TEXT NOT NULL,
+    UpdatedBy TEXT,
+    UpdatedAt TEXT,
+    PublishedBy TEXT,
+    PublishedAt TEXT,
+    WithdrawnBy TEXT,
+    WithdrawnAt TEXT,
+    WithdrawalReason TEXT
+);
+CREATE INDEX IF NOT EXISTS IX_Circulars_Issue ON Circulars(IssueDate DESC);
+
+CREATE TABLE IF NOT EXISTS CircularFiles (
+    Id INTEGER PRIMARY KEY,
+    CircularId INTEGER NOT NULL REFERENCES Circulars(Id),
+    Version INTEGER NOT NULL,
+    StoredPath TEXT NOT NULL,
+    OriginalFileName TEXT NOT NULL,
+    ContentType TEXT NOT NULL,
+    SizeBytes INTEGER NOT NULL,
+    Sha256 TEXT NOT NULL,
+    UploadedBy TEXT NOT NULL,
+    UploadedAt TEXT NOT NULL,
+    UNIQUE (CircularId, Version)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS CircularSearch USING fts5(
+    CircularNumber, Title, Category, IssuingVertical, Keywords, Synopsis,
+    content='Circulars', content_rowid='Id', tokenize='unicode61');
+
+CREATE TRIGGER IF NOT EXISTS Circulars_ai AFTER INSERT ON Circulars BEGIN
+    INSERT INTO CircularSearch(rowid, CircularNumber, Title, Category, IssuingVertical, Keywords, Synopsis)
+    VALUES (new.Id, new.CircularNumber, new.Title, new.Category, new.IssuingVertical, new.Keywords, new.Synopsis);
+END;
+CREATE TRIGGER IF NOT EXISTS Circulars_ad AFTER DELETE ON Circulars BEGIN
+    INSERT INTO CircularSearch(CircularSearch, rowid, CircularNumber, Title, Category, IssuingVertical, Keywords, Synopsis)
+    VALUES ('delete', old.Id, old.CircularNumber, old.Title, old.Category, old.IssuingVertical, old.Keywords, old.Synopsis);
+END;
+CREATE TRIGGER IF NOT EXISTS Circulars_au AFTER UPDATE ON Circulars BEGIN
+    INSERT INTO CircularSearch(CircularSearch, rowid, CircularNumber, Title, Category, IssuingVertical, Keywords, Synopsis)
+    VALUES ('delete', old.Id, old.CircularNumber, old.Title, old.Category, old.IssuingVertical, old.Keywords, old.Synopsis);
+    INSERT INTO CircularSearch(rowid, CircularNumber, Title, Category, IssuingVertical, Keywords, Synopsis)
+    VALUES (new.Id, new.CircularNumber, new.Title, new.Category, new.IssuingVertical, new.Keywords, new.Synopsis);
+END;
+
+CREATE TABLE IF NOT EXISTS Notices (
+    Id INTEGER PRIMARY KEY,
+    Title TEXT NOT NULL,
+    Body TEXT,
+    IsImportant INTEGER NOT NULL DEFAULT 0,
+    StartsOn TEXT NOT NULL,
+    EndsOn TEXT,
+    IsActive INTEGER NOT NULL DEFAULT 1,
+    PostedBy TEXT NOT NULL,
+    PostedAt TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS Requests (
+    Id INTEGER PRIMARY KEY,
+    RequestNumber TEXT UNIQUE,
+    FormType TEXT NOT NULL DEFAULT 'GeneralAdministrativeApproval',
+    Subject TEXT NOT NULL,
+    RequestCategory TEXT,
+    Amount REAL,
+    RequiredBy TEXT,
+    Details TEXT NOT NULL,
+    SubmitterUserId INTEGER NOT NULL REFERENCES Users(Id),
+    SubmitterName TEXT NOT NULL,
+    SubmitterVertical TEXT,
+    ReviewerUserId INTEGER REFERENCES Users(Id),
+    ApproverUserId INTEGER REFERENCES Users(Id),
+    State TEXT NOT NULL,
+    AssignedToUserId INTEGER REFERENCES Users(Id),
+    RowVersion INTEGER NOT NULL DEFAULT 1,
+    CreatedAt TEXT NOT NULL,
+    SubmittedAt TEXT,
+    UpdatedAt TEXT NOT NULL,
+    ClosedAt TEXT
+);
+CREATE INDEX IF NOT EXISTS IX_Requests_Assigned ON Requests(AssignedToUserId, State);
+CREATE INDEX IF NOT EXISTS IX_Requests_Submitter ON Requests(SubmitterUserId);
+
+CREATE TABLE IF NOT EXISTS ApprovalActions (
+    Id INTEGER PRIMARY KEY,
+    RequestId INTEGER NOT NULL REFERENCES Requests(Id),
+    Action TEXT NOT NULL,
+    FromState TEXT,
+    ToState TEXT NOT NULL,
+    ActorUserId INTEGER NOT NULL,
+    ActorName TEXT NOT NULL,
+    ActorRole TEXT NOT NULL,
+    Remarks TEXT,
+    Timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS IX_ApprovalActions_Request ON ApprovalActions(RequestId);
+CREATE TRIGGER IF NOT EXISTS ApprovalActions_no_update BEFORE UPDATE ON ApprovalActions
+BEGIN SELECT RAISE(ABORT, 'Approval history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ApprovalActions_no_delete BEFORE DELETE ON ApprovalActions
+BEGIN SELECT RAISE(ABORT, 'Approval history is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS Attachments (
+    Id INTEGER PRIMARY KEY,
+    RequestId INTEGER NOT NULL REFERENCES Requests(Id),
+    StoredPath TEXT NOT NULL,
+    OriginalFileName TEXT NOT NULL,
+    ContentType TEXT NOT NULL,
+    SizeBytes INTEGER NOT NULL,
+    Sha256 TEXT NOT NULL,
+    UploadedByUserId INTEGER NOT NULL,
+    UploadedBy TEXT NOT NULL,
+    UploadedAt TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS Attachments_no_delete BEFORE DELETE ON Attachments
+BEGIN SELECT RAISE(ABORT, 'Attachments cannot be deleted'); END;
+
+CREATE TABLE IF NOT EXISTS AuditLog (
+    Id INTEGER PRIMARY KEY,
+    Timestamp TEXT NOT NULL,
+    Actor TEXT NOT NULL,
+    Action TEXT NOT NULL,
+    EntityType TEXT,
+    EntityId TEXT,
+    Details TEXT,
+    IpAddress TEXT,
+    PrevHash TEXT NOT NULL,
+    Hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS IX_AuditLog_Time ON AuditLog(Timestamp);
+CREATE TRIGGER IF NOT EXISTS AuditLog_no_update BEFORE UPDATE ON AuditLog
+BEGIN SELECT RAISE(ABORT, 'Audit log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS AuditLog_no_delete BEFORE DELETE ON AuditLog
+BEGIN SELECT RAISE(ABORT, 'Audit log is append-only'); END;
+
+INSERT INTO SchemaInfo (Version, AppliedAt)
+SELECT 1, strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE NOT EXISTS (SELECT 1 FROM SchemaInfo);
+""";
+}

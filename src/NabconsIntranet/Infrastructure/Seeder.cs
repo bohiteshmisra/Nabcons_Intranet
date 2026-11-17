@@ -1,0 +1,468 @@
+using System.Security.Claims;
+using NabconsIntranet.Data;
+
+namespace NabconsIntranet.Infrastructure;
+
+/// <summary>
+/// First-run setup. Always ensures an administrator exists and master lists are populated.
+/// When SeedDemoData is true (default for the pilot) it also loads clearly-marked SYNTHETIC
+/// staff, circulars and requests so the system can be demonstrated immediately.
+/// </summary>
+public sealed class Seeder(Db db, IntranetOptions o, UserRepository users, MasterRepository masters, StaffRepository staff,
+    CircularRepository circulars, NoticeRepository notices, RequestWorkflow workflow, FileStore files, AuditService audit, Fmt fmt,
+    ENoteWorkflow enotes, BoardRepository board, ComplianceWorkflow compliance, InwardWorkflow inward, InwardAccess inwardAccess, ILogger<Seeder> log)
+{
+    public const string DemoPassword = "Nabcons@2026";
+
+    public static readonly (string user, string name, string roles, string vertical, string note)[] DemoUsers =
+    {
+        ("admin", "System Administrator", "Staff,Administrator", "IT & Digital", "Administrator - users, masters, backups"),
+        ("publisher", "Priya Kulkarni", "Staff,Publisher", "HR & Administration", "Publisher - circulars and notices"),
+        ("approver1", "Rajesh Iyer", "Staff,Approver", "HR & Administration", "Approver - Reviewing Officer"),
+        ("approver2", "Anita Deshmukh", "Staff,Approver", "Finance & Accounts", "Approver - Sanctioning Authority"),
+        ("staff", "Vikram Singh", "Staff", "Rural Infrastructure", "Staff - browse and submit requests"),
+        ("auditor", "Meera Nair", "Staff,Auditor", "Finance & Accounts", "Auditor - read-only audit history"),
+        ("bdu", "Rohan Kapoor", "Staff", "BDU", "BDU vertical - business lead pipeline"),
+        ("coo", "Kavita Rao", "Staff,LeadViewer", "HR & Administration", "LeadViewer (COO) - sees all business leads; Compliance Viewer"),
+        ("cs", "Sunita Menon", "Staff", "HR & Administration", "Company Secretary - Compliance Admin (Compliance Cell)"),
+    };
+
+    /// <summary>Capitals of all 28 states and 8 union territories (Chandigarh serves Punjab, Haryana and the UT; J&amp;K has Srinagar and Jammu).</summary>
+    public static readonly string[] StateAndUtCapitals =
+    {
+        "Agartala", "Aizawl", "Amaravati", "Bengaluru", "Bhopal", "Bhubaneswar", "Chandigarh", "Chennai", "Daman", "Dehradun", "Dispur", "Gandhinagar", "Gangtok", "Hyderabad", "Imphal", "Itanagar", "Jaipur", "Jammu", "Kavaratti", "Kohima", "Kolkata", "Leh", "Lucknow", "Mumbai", "New Delhi", "Panaji", "Patna", "Puducherry", "Raipur", "Ranchi", "Shillong", "Shimla", "Srinagar", "Sri Vijaya Puram (Port Blair)", "Thiruvananthapuram"
+    };
+
+    public void Run()
+    {
+        AuditService.AmbientActor.Value = "system (first-run setup)";
+        try
+        {
+            SeedMasters();
+            EnsureAdmin();
+            if (o.SeedDemoData && staff.Count() == 0 && circulars.CountPublished() == 0)
+            {
+                log.LogInformation("Loading synthetic demo data");
+                SeedDemo();
+            }
+        }
+        finally
+        {
+            AuditService.AmbientActor.Value = null;
+        }
+    }
+
+    private void SeedMasters()
+    {
+        bool Ensure(string type, params string[] names)
+        {
+            if (masters.List(type, activeOnly: false).Count > 0) return false;
+            for (int i = 0; i < names.Length; i++) masters.Add(type, names[i], i);
+            audit.Log("Master.Seeded", "MasterItems", type, string.Join("; ", names));
+            return true;
+        }
+        var newVerticals = Ensure(MasterTypes.Vertical, "Agri & Allied", "Climate Change & Sustainability", "Rural Infrastructure", "Financial Inclusion",
+            "Microfinance & Livelihoods", "Watershed & Natural Resources", "IT & Digital", "Finance & Accounts", "HR & Administration", "BDU");
+        // e-Note number codes for the standard verticals: only when the list was created just now (never on an existing database)
+        var codes = new Dictionary<string, string>
+        {
+            ["Agri & Allied"] = "AGRI", ["Climate Change & Sustainability"] = "CCS", ["Rural Infrastructure"] = "RID", ["Financial Inclusion"] = "FI",
+            ["Microfinance & Livelihoods"] = "MFL", ["Watershed & Natural Resources"] = "WNR", ["IT & Digital"] = "IT", ["Finance & Accounts"] = "FA",
+            ["HR & Administration"] = "HR", ["BDU"] = "BDU",
+        };
+        if (newVerticals)
+            foreach (var v in masters.List(MasterTypes.Vertical, activeOnly: false).Where(v => codes.ContainsKey(v.Name)))
+                masters.SetCode(v.Id, codes[v.Name]);
+        var offices = new[] { "Mumbai (Head Office)", "New Delhi", "Lucknow", "Bhopal", "Pune", "Hyderabad", "Bengaluru",
+            "Kolkata", "Guwahati", "Chennai", "Jaipur" };
+        Ensure(MasterTypes.Location, offices.Concat(StateAndUtCapitals.Where(c =>
+            !offices.Any(o => o.Equals(c, StringComparison.OrdinalIgnoreCase) || o.StartsWith(c + " (", StringComparison.OrdinalIgnoreCase)))).ToArray());
+        Ensure(MasterTypes.CircularCategory, "HR Circulars", "Administrative Orders", "IT & Security Advisories");
+        Ensure(MasterTypes.RequestCategory, "Office Administration", "Procurement (below delegated limit)", "Travel / Tour Approval",
+            "Training / Workshop Nomination", "IT Equipment / Access", "Other");
+    }
+
+    private void EnsureAdmin()
+    {
+        if (o.IsWindowsAuth) return; // Windows mode: administrators come from WindowsAdministrators in appsettings.json
+        if (users.CountActiveAdmins() > 0) return;
+        var existing = users.GetByUsername("admin");
+        if (existing == null)
+        {
+            var id = users.Create(new AppUser
+            {
+                Username = "admin", DisplayName = "System Administrator", Roles = "Staff,Administrator",
+                Vertical = "IT & Digital", PasswordHash = PasswordHasher.Hash(o.InitialAdminPassword), MustChangePassword = true,
+            }, "system");
+            audit.Log("User.Created", "User", id, "Initial administrator account 'admin' (must change password at first sign-in)");
+        }
+    }
+
+    private ClaimsPrincipal Principal(string username)
+    {
+        var u = users.GetByUsername(username)!;
+        return new ClaimsPrincipal(IdentityBuilder.BuildIdentity(u, "seed"));
+    }
+
+    private void SeedDemo()
+    {
+        // --- demo users (local mode only) ---
+        if (!o.IsWindowsAuth)
+        {
+            foreach (var d in DemoUsers.Where(d => d.user != "admin"))
+            {
+                if (users.GetByUsername(d.user) != null) continue;
+                var id = users.Create(new AppUser
+                {
+                    Username = d.user, DisplayName = d.name, Roles = d.roles, Vertical = d.vertical,
+                    Email = d.user + "@nabcons.local", PasswordHash = PasswordHasher.Hash(DemoPassword),
+                }, "system");
+                audit.Log("User.Created", "User", id, $"Demo account {d.user} ({d.roles})");
+            }
+            // demo admin keeps a known password so the demo can be run end-to-end
+            var admin = users.GetByUsername("admin");
+            if (admin != null && o.ShowDemoAccountsOnLogin)
+                users.SetPassword(admin.Id, DemoPassword, mustChange: false, "system");
+        }
+
+        // --- 25 synthetic staff ---
+        var people = new (string name, string desig, string vertical, string loc)[]
+        {
+            ("Aarav Sharma", "Managing Director", "HR & Administration", "Mumbai (Head Office)"),
+            ("Kavita Rao", "Chief Operating Officer", "HR & Administration", "Mumbai (Head Office)"),
+            ("Rajesh Iyer", "Deputy General Manager", "HR & Administration", "Mumbai (Head Office)"),
+            ("Anita Deshmukh", "Chief Financial Officer", "Finance & Accounts", "Mumbai (Head Office)"),
+            ("Priya Kulkarni", "Assistant General Manager", "HR & Administration", "Mumbai (Head Office)"),
+            ("Meera Nair", "Manager - Internal Audit", "Finance & Accounts", "Mumbai (Head Office)"),
+            ("Vikram Singh", "Senior Consultant", "Rural Infrastructure", "New Delhi"),
+            ("Sunita Verma", "Senior Consultant", "Agri & Allied", "Lucknow"),
+            ("Arjun Mehta", "Consultant", "Climate Change & Sustainability", "Pune"),
+            ("Deepa Pillai", "Consultant", "Financial Inclusion", "Chennai"),
+            ("Rohit Gupta", "Project Manager", "Rural Infrastructure", "Bhopal"),
+            ("Neha Joshi", "Consultant", "Watershed & Natural Resources", "Jaipur"),
+            ("Sanjay Patil", "Senior Consultant", "Microfinance & Livelihoods", "Pune"),
+            ("Farah Khan", "Manager - IT", "IT & Digital", "Mumbai (Head Office)"),
+            ("Manoj Das", "Regional Coordinator", "Agri & Allied", "Kolkata"),
+            ("Lakshmi Reddy", "Consultant", "Climate Change & Sustainability", "Hyderabad"),
+            ("Harish Bora", "Regional Coordinator", "Watershed & Natural Resources", "Guwahati"),
+            ("Pooja Agarwal", "Accounts Officer", "Finance & Accounts", "Mumbai (Head Office)"),
+            ("Kiran Shetty", "Consultant", "Financial Inclusion", "Bengaluru"),
+            ("Amit Chauhan", "Project Associate", "Rural Infrastructure", "New Delhi"),
+            ("Swati Mishra", "Project Associate", "Agri & Allied", "Lucknow"),
+            ("Naveen Kumar", "Systems Officer", "IT & Digital", "Hyderabad"),
+            ("Rekha Menon", "HR Officer", "HR & Administration", "Mumbai (Head Office)"),
+            ("Gaurav Tiwari", "Consultant", "Microfinance & Livelihoods", "Bhopal"),
+            ("Ishita Banerjee", "Project Associate", "Climate Change & Sustainability", "Kolkata"),
+            ("Rohan Kapoor", "Manager - Business Development", "BDU", "Mumbai (Head Office)"),
+        };
+        for (int i = 0; i < people.Length; i++)
+        {
+            var p = people[i];
+            var parts = p.name.ToLowerInvariant().Split(' ');
+            staff.Upsert(new StaffMember
+            {
+                EmployeeCode = $"NC{1001 + i}",
+                FullName = p.name,
+                Designation = p.desig,
+                Vertical = p.vertical,
+                Location = p.loc,
+                OfficialEmail = $"{parts[0]}.{parts[^1]}@nabcons.local",
+                Extension = (2100 + i * 3).ToString(),
+                Mobile = i % 4 == 0 ? $"90000 0{1000 + i}" : null,
+                ShowMobile = i % 4 == 0,
+                ActiveFrom = "2024-04-01",
+            }, "system (demo seed)");
+        }
+        audit.Log("Staff.Imported", "Staff", null, $"{people.Length} synthetic staff rows loaded (demo seed)");
+        // link demo accounts to their (synthetic) directory entries so My Profile works out of the box
+        foreach (var d in DemoUsers)
+        {
+            var u = users.GetByUsername(d.user);
+            var s = staff.All().FirstOrDefault(x => x.FullName == d.name);
+            if (u != null && s != null && u.StaffId == null) db.Exec("UPDATE Users SET StaffId = @sid WHERE Id = @uid", new { sid = s.StaffId, uid = u.Id });
+        }
+
+        // --- 10 synthetic circulars across 3 categories ---
+        var y = fmt.Today.Year;
+        var list = new (string no, string title, string cat, string vert, string date, string kw, string synopsis, string vis)[]
+        {
+            ($"NABCONS/HR/{y}/01", "Revised leave application procedure", "HR Circulars", "HR & Administration", $"{y}-01-15",
+                "leave, attendance, HR", "Leave applications are to be routed through the reporting officer at least three working days in advance. Supersedes earlier procedure.", Visibility.AllStaff),
+            ($"NABCONS/HR/{y}/02", "Office timings during summer months", "HR Circulars", "HR & Administration", $"{y}-03-20",
+                "office timings, attendance", "Office hours from April to June are 09:00 to 17:30 at all locations.", Visibility.AllStaff),
+            ($"NABCONS/HR/{y}/03", "Nomination for in-house training programmes", "HR Circulars", "HR & Administration", $"{y}-05-02",
+                "training, capacity building, nomination", "Verticals may nominate up to two officers per quarter for in-house training.", Visibility.AllStaff),
+            ($"NABCONS/ADM/{y}/01", "Procedure for booking conference rooms", "Administrative Orders", "HR & Administration", $"{y}-02-10",
+                "conference room, booking, administration", "Conference rooms at Head Office are booked through the Administration desk (Ext. 2105).", Visibility.AllStaff),
+            ($"NABCONS/ADM/{y}/02", "Tour and travel claim submission timelines", "Administrative Orders", "Finance & Accounts", $"{y}-04-08",
+                "travel, tour, claims, reimbursement", "Travel claims are to be submitted within 15 days of completion of tour with supporting documents.", Visibility.AllStaff),
+            ($"NABCONS/ADM/{y}/03", "Stationery requisition process", "Administrative Orders", "HR & Administration", $"{y}-06-12",
+                "stationery, requisition, procurement", "Monthly stationery requisitions are consolidated by each vertical and sent by the 5th of every month.", Visibility.AllStaff),
+            ($"NABCONS/ADM/{y}/04", "Field project expense approval matrix", "Administrative Orders", "Rural Infrastructure", $"{y}-07-01",
+                "delegation, approval matrix, field expenses", "Approval levels for field project expenses within the Rural Infrastructure vertical.", Visibility.Vertical),
+            ($"NABCONS/IT/{y}/01", "Password and screen-lock policy", "IT & Security Advisories", "IT & Digital", $"{y}-01-28",
+                "password, screen lock, cyber security", "Passwords must be at least 10 characters and screens must lock after 5 minutes of inactivity.", Visibility.AllStaff),
+            ($"NABCONS/IT/{y}/02", "Use of removable media on office PCs", "IT & Security Advisories", "IT & Digital", $"{y}-04-22",
+                "USB, removable media, data protection", "Removable media may be used only after scanning and only with IT approval.", Visibility.AllStaff),
+            ($"NABCONS/IT/{y}/03", "Phishing awareness advisory", "IT & Security Advisories", "IT & Digital", $"{y}-08-05",
+                "phishing, email, cyber security, awareness", "Do not open unexpected attachments. Report suspicious messages to the IT desk.", Visibility.AllStaff),
+        };
+        var ids = new List<long>();
+        foreach (var c in list)
+        {
+            var id = circulars.Create(new Circular
+            {
+                CircularNumber = c.no, Title = c.title, Category = c.cat, IssuingVertical = c.vert, IssueDate = c.date,
+                EffectiveDate = c.date, Keywords = c.kw, Synopsis = c.synopsis, Visibility = c.vis, CreatedBy = "publisher",
+            });
+            var pdf = SimplePdf.Create("NABCONS - " + c.title, new[]
+            {
+                "SAMPLE / SYNTHETIC DEMONSTRATION DOCUMENT - NOT AN OFFICIAL CIRCULAR",
+                "",
+                "Circular No.: " + c.no,
+                "Date: " + c.date,
+                "Category: " + c.cat,
+                "Issued by: " + c.vert,
+                "",
+                c.synopsis,
+                "",
+                "This document was generated automatically to demonstrate the NABCONS Intranet circular repository.",
+                "Replace it with genuine circulars after the pilot is approved.",
+            });
+            var stored = files.SaveBytes(pdf, c.no.Replace('/', '-') + ".pdf", "circulars");
+            circulars.AddFile(id, stored, "publisher");
+            ids.Add(id);
+        }
+        // supersession demo: HR/03 (new) supersedes nothing; create HR/04 superseding HR/01
+        var supersedingId = circulars.Create(new Circular
+        {
+            CircularNumber = $"NABCONS/HR/{y}/04", Title = "Leave application procedure (revised)", Category = "HR Circulars",
+            IssuingVertical = "HR & Administration", IssueDate = $"{y}-09-01", EffectiveDate = $"{y}-09-15",
+            Keywords = "leave, attendance, HR, revised", Synopsis = "Leave applications are now routed through the intranet request form. This circular supersedes the January procedure.",
+            Visibility = Visibility.AllStaff, SupersedesId = ids[0], CreatedBy = "publisher",
+        });
+        circulars.AddFile(supersedingId, files.SaveBytes(SimplePdf.Create("NABCONS - Leave application procedure (revised)", new[]
+        {
+            "SAMPLE / SYNTHETIC DEMONSTRATION DOCUMENT - NOT AN OFFICIAL CIRCULAR", "", $"Circular No.: NABCONS/HR/{y}/04",
+            $"Supersedes: NABCONS/HR/{y}/01", "", "Leave applications are now routed through the intranet request form.",
+        }), $"NABCONS-HR-{y}-04.pdf", "circulars"), "publisher");
+
+        foreach (var id in ids) circulars.Publish(id, "publisher");
+        circulars.Publish(supersedingId, "publisher");
+        circulars.Withdraw(ids[5], "Replaced by the consolidated procurement process (demo of a withdrawn circular).", "publisher");
+        audit.Log("Circular.Seeded", "Circulars", null, $"{ids.Count + 1} synthetic circulars published; 1 superseded, 1 withdrawn (demo seed)");
+
+        notices.Add(new Notice
+        {
+            Title = "Welcome to the NABCONS Intranet pilot", IsImportant = true,
+            Body = "This is a pilot running entirely inside the NABARD LAN. All staff, circulars and requests shown are synthetic sample data.",
+            StartsOn = fmt.Today.AddDays(-1).ToString("yyyy-MM-dd"), PostedBy = "Priya Kulkarni", PostedAt = Db.Now(),
+        });
+        notices.Add(new Notice
+        {
+            Title = "Quarterly backup restore test", Body = "The administrator will test a full restore from backup on the last working day of the quarter.",
+            StartsOn = fmt.Today.AddDays(-1).ToString("yyyy-MM-dd"), PostedBy = "Priya Kulkarni", PostedAt = Db.Now(),
+        });
+
+        // --- sample requests with genuine workflow history (local mode only: needs demo users) ---
+        if (o.IsWindowsAuth) return;
+        var staffP = Principal("staff");
+        var r1 = Principal("approver1");
+        var r2 = Principal("approver2");
+        long reviewer = r1.UserId(), approver = r2.UserId();
+
+        long NewReq(string subject, string cat, double? amount, string details)
+        {
+            AuditService.AmbientActor.Value = "staff";
+            return workflow.CreateDraft(new ApprovalRequest
+            {
+                Subject = subject, RequestCategory = cat, Amount = amount, Details = details,
+                RequiredBy = fmt.Today.AddDays(14).ToString("yyyy-MM-dd"), ReviewerUserId = reviewer, ApproverUserId = approver,
+            }, staffP);
+        }
+        void Act(long id, string action, ClaimsPrincipal who, string? remarks = null)
+        {
+            AuditService.AmbientActor.Value = who.UserName();
+            var r = workflow.Get(id)!;
+            workflow.Execute(id, action, remarks, r.RowVersion, who);
+        }
+
+        var a = NewReq("Purchase of two document scanners for Delhi office", "Procurement (below delegated limit)", 38500,
+            "Two flatbed scanners are needed to digitise project files at the New Delhi office. Three quotations obtained; lowest is attached in the physical file.");
+        Act(a, "Submit", staffP);
+        Act(a, "Recommend", r1, "Requirement verified. Recommended.");
+        Act(a, "Approve", r2, "Sanctioned within delegated powers.");
+
+        var b = NewReq("Tour to Lucknow for project review meeting", "Travel / Tour Approval", 12000,
+            "Two-day tour to Lucknow to attend the quarterly project review with the state implementing agency.");
+        Act(b, "Submit", staffP);
+        Act(b, "Recommend", r1, "Recommended.");
+        Act(b, "Reject", r2, "Meeting is being held by video conference; physical travel not required.");
+
+        var c2 = NewReq("Nomination for GIS mapping workshop", "Training / Workshop Nomination", null,
+            "Requesting nomination to the three-day GIS mapping workshop for watershed projects.");
+        Act(c2, "Submit", staffP);
+
+        NewReq("Additional monitor for data analysis work", "IT Equipment / Access", 9500,
+            "A second monitor would help with spreadsheet-heavy monitoring and evaluation work.");
+
+        // --- sample e-Notes: one approved after moving through the chain, one pending with approver1, one draft ---
+        var coo = Principal("coo");
+        void As(ClaimsPrincipal p) => AuditService.AmbientActor.Value = p.UserName();
+        long Rv(long id) => db.Scalar<long>("SELECT RowVersion FROM ENotes WHERE Id = @id", new { id });
+        As(staffP);
+        var e1 = enotes.Create(new ENoteWorkflow.DraftInput("Hiring of a vehicle for the Rajasthan watershed evaluation survey", "Projects & assignments",
+            "The evaluation of the watershed programme in 12 districts of Rajasthan requires field visits over 18 working days.\n\n" +
+            "Quotations were obtained from three empanelled operators. The lowest rate is ₹ 2,850 per day including the driver and fuel up to 120 km.\n\n" +
+            "क्षेत्र भ्रमण के लिए वाहन की आवश्यकता है। व्यय परियोजना बजट के अंतर्गत है।\n\n" +
+            "Approval is requested for hiring the vehicle from the lowest bidder for 18 days at a total cost not exceeding ₹ 51,300.", false, true), staffP);
+        enotes.MarkTo(e1, reviewer, "Please examine.", Rv(e1), staffP);
+        As(r1);
+        enotes.Comment(e1, "Rates verified against the empanelment list. Budget head has sufficient balance.", Rv(e1), r1);
+        enotes.MarkTo(e1, coo.UserId(), "Recommended for approval.", Rv(e1), r1);
+        As(coo);
+        enotes.Decide(e1, true, "Approved. Ensure the logbook is maintained and certified by the team leader.", Rv(e1), coo);
+
+        As(staffP);
+        var e2 = enotes.Create(new ENoteWorkflow.DraftInput("Renewal of the annual maintenance contract for office photocopiers", "Procurement",
+            "The AMC for the two photocopiers at Head Office expires on 31 March.\n\nThe vendor has offered renewal at the same rate as last year. Renewal for one year is proposed.",
+            false, true), staffP);
+        enotes.MarkTo(e2, reviewer, null, Rv(e2), staffP);
+
+        enotes.Create(new ENoteWorkflow.DraftInput("Proposal for an internal workshop on GIS tools", "General administration",
+            "A one-day internal workshop on GIS tools is proposed for the project teams.", false, true), staffP);
+
+        // --- sample message-board posts (one pinned by the administrator) ---
+        var adminP = Principal("admin");
+        As(adminP);
+        var welcome = board.Create("Welcome to the new Message Board!\n\nShare news, greetings and photos with colleagues across NABCONS. Please keep posts official and courteous.",
+            Array.Empty<IFormFile>(), adminP);
+        board.SetPinned(welcome, true, adminP);
+        As(staffP);
+        board.Create("The Rajasthan watershed evaluation team completed its field visits this week. Thanks to everyone who supported the survey!",
+            Array.Empty<IFormFile>(), staffP);
+        SeedCompliance(staffP, r1, r2, coo);
+        SeedInward(staffP, r1, r2, coo);
+        AuditService.AmbientActor.Value = "system (first-run setup)";
+    }
+
+    /// <summary>Synthetic compliance demo (v1.6): a Compliance Admin, a viewer, a Board meeting and an internal audit with points.</summary>
+    private void SeedCompliance(ClaimsPrincipal staffP, ClaimsPrincipal r1, ClaimsPrincipal r2, ClaimsPrincipal coo)
+    {
+        var cs = Principal("cs");
+        compliance.GrantCore(cs.UserId(), ComplianceGrant.Admin, "system (first-run setup)");
+        compliance.GrantCore(coo.UserId(), ComplianceGrant.Viewer, "system (first-run setup)");
+        AuditService.AmbientActor.Value = "cs";
+        string D(int days) => fmt.Today.AddDays(days).ToString("yyyy-MM-dd");
+        long Forum(string name) => masters.List(MasterTypes.ComplianceForum).First(m => m.Name == name).Id;
+        var board = compliance.CreateEvent(new ComplianceEventInput
+        {
+            SourceType = ComplianceSource.Board, ForumId = Forum("Board of Directors"), EventNo = "98th", Title = "Board meeting (SYNTHETIC SAMPLE)",
+            HeldOn = D(-45), ReportedTo = "Board of Directors", ReportingCycle = ComplianceCycle.NextMeeting, NextReportingOn = D(40),
+            SourceKeptAt = "File no. CS/BM/98 (synthetic)",
+        }, cs);
+        compliance.CreatePoint(board, new CompliancePointInput
+        {
+            RefNo = "Memo No. 7", RefSubject = "Review of IT security policy", PointText = "Place the revised IT security policy before the Board after vetting by the Risk Management Committee.",
+            Category = "IT & Systems", Priority = "High", OwnerVertical = "IT & Digital", PrimaryOfficerUserId = r1.UserId(), OfficerCode = "GM(IT)", DueDate = D(20),
+        }, cs);
+        var p2 = compliance.CreatePoint(board, new CompliancePointInput
+        {
+            RefNo = "Memo No. 9", RefSubject = "Statutory audit observations", PointText = "Obtain the views of the statutory auditor on the treatment of unbilled revenue and report.",
+            Category = "Finance & Accounts", Priority = "Medium", OwnerVertical = "Finance & Accounts", PrimaryOfficerUserId = r2.UserId(), OfficerCode = "CFO", DueDate = D(-5),
+            InitialStatus = CStatus.PendingExternal, InitialAtrText = "Reference sent to the statutory auditor; guidance awaited.", InitialAsOn = D(-10),
+        }, cs);
+        var p3 = compliance.CreatePoint(board, new CompliancePointInput
+        {
+            RefNo = "Chairman's opening remarks", PointText = "Prepare a note on the pipeline of watershed evaluation assignments for the next meeting.",
+            Category = "Business Development", OwnerVertical = "Rural Infrastructure", PrimaryOfficerUserId = staffP.UserId(), DueDate = D(30),
+        }, cs);
+        AuditService.AmbientActor.Value = "staff";
+        long Rv(long id) => db.Scalar<long>("SELECT RowVersion FROM CompliancePoints WHERE Id = @id", new { id });
+        var upd = compliance.SubmitUpdate(p3, D(-1), "Draft note prepared listing 14 assignments (₹ 3.2 crore). Being vetted by the vertical head.", CStatus.Ongoing, "Shared folder BD / Pipeline (synthetic)", Rv(p3), staffP);
+        AuditService.AmbientActor.Value = "cs";
+        compliance.AcceptUpdate(p3, upd, null, Rv(p3), cs);
+
+        var ia = compliance.CreateEvent(new ComplianceEventInput
+        {
+            SourceType = ComplianceSource.InternalAudit, ForumId = Forum("Internal Auditor"), EventNo = "Q2 FY 2026-27", Title = "Internal audit report (SYNTHETIC SAMPLE)",
+            PeriodFrom = D(-130), PeriodTo = D(-40), ReportReceivedOn = D(-30), ReportedTo = "Audit Committee", ReportingCycle = ComplianceCycle.Quarterly,
+        }, cs);
+        compliance.CreatePoint(ia, new CompliancePointInput
+        {
+            RefNo = "1", PointText = "Sundry creditors outstanding for more than three years (12 parties, ₹ 4.6 lakh) should be reviewed and written back where appropriate.",
+            Category = "Finance & Accounts", OwnerVertical = "Finance & Accounts", PrimaryOfficerUserId = r2.UserId(), OfficerCode = "AC(AA)", DueDate = D(15), Amount = 460000,
+        }, cs);
+        compliance.CreatePoint(ia, new CompliancePointInput
+        {
+            RefNo = "2", PointText = "EMD refunds of closed tenders are pending; reconcile the EMD register with the bank statement.",
+            Category = "Finance & Accounts", OwnerVertical = "Finance & Accounts", PrimaryOfficerUserId = r2.UserId(), OfficerCode = "AC(AA)", DueDate = D(-3),
+        }, cs);
+        _ = p2;
+    }
+
+    /// <summary>
+    /// Synthetic inward demo (v1.7, new databases only): office codes HO / DEL, a registry operator, a viewer and an
+    /// Accounts user, two project codes, letters and invoices at different stages.
+    /// </summary>
+    private void SeedInward(ClaimsPrincipal staffP, ClaimsPrincipal r1, ClaimsPrincipal r2, ClaimsPrincipal coo)
+    {
+        if (!inwardAccess.Options.Enabled) return;
+        var ho = masters.List(MasterTypes.Location, activeOnly: false).FirstOrDefault(m => m.Name == "Mumbai (Head Office)");
+        var del = masters.List(MasterTypes.Location, activeOnly: false).FirstOrDefault(m => m.Name == "New Delhi");
+        if (ho == null) return;
+        masters.SetCode(ho.Id, "HO");
+        if (del != null) masters.SetCode(del.Id, "DEL");
+        var publisher = Principal("publisher");
+        var now = Db.Now();
+        void Grant(long userId, string role, long officeId)
+        {
+            db.Exec("INSERT INTO InwardMembers (UserId, Role, OfficeId, GrantedByName, GrantedAt) VALUES (@userId, @role, @officeId, 'system (first-run setup)', @now)", new { userId, role, officeId, now });
+            db.Exec("INSERT INTO InwardMemberHistory (UserId, Action, Role, OfficeId, ActorName, At) VALUES (@userId, 'Granted', @role, @officeId, 'system (first-run setup)', @now)", new { userId, role, officeId, now });
+        }
+        Grant(publisher.UserId(), InwardRole.Operator, ho.Id);
+        Grant(coo.UserId(), InwardRole.Viewer, 0);
+        Grant(r2.UserId(), InwardRole.Accounts, 0);
+        inwardAccess.Invalidate();
+        db.Exec("INSERT INTO ProjectCodes (Code, Name, OwnerUserId, IsActive, UpdatedAt, UpdatedBy) VALUES ('NC-2026-014', 'Impact evaluation of WDF projects (SYNTHETIC)', @o, 1, @now, 'system'), ('NC-2026-021', 'Baseline survey, FPO promotion (SYNTHETIC)', @s, 1, @now, 'system')",
+            new { o = r1.UserId(), s = staffP.UserId(), now });
+
+        AuditService.AmbientActor.Value = "publisher";
+        string D(int days) => fmt.Today.AddDays(days).ToString("yyyy-MM-dd");
+        long Rv(long id) => db.Scalar<long>("SELECT RowVersion FROM InwardItems WHERE Id = @id", new { id });
+        InwardInput Letter(string sender, string org, string subject, int daysAgo, string type = InwardType.Letter) => new()
+        {
+            OfficeId = ho.Id, ItemType = type, Mode = "Post", ReceivedOn = D(-daysAgo), ReceivedTime = "11:00", SenderName = sender, SenderOrg = org,
+            Subject = subject, Priority = "Normal", ActionRequired = InwardAction.Reply, KeptAt = "Registry rack 2 (synthetic)", Pages = 3,
+        };
+        var l1 = Letter("Chief General Manager", "NABARD Regional Office, Lucknow (SYNTHETIC)", "Request for proposal — impact evaluation of WDF projects", 3);
+        l1.SenderRef = "NB.UP/RFP/112/2026-27"; l1.SenderRefDate = D(-5); l1.MarkToUserId = staffP.UserId(); l1.Category = "Client / project";
+        inward.Inward(l1, publisher, true);
+        var l2 = Letter("Under Secretary", "Department of Agriculture (SYNTHETIC)", "Guidelines for third-party monitoring of watershed works", 2, InwardType.GovtOrder);
+        l2.ActionRequired = InwardAction.Information; l2.Category = "Government / regulator";
+        inward.Inward(l2, publisher, true);
+        var l3 = Letter("Advocate", "Sample & Co. (SYNTHETIC)", "Notice regarding a contract dispute", 1, InwardType.LegalNotice);
+        l3.IsConfidential = true; l3.Priority = "Urgent"; l3.MarkToUserId = r2.UserId(); l3.Category = "Legal";
+        inward.Inward(l3, publisher, true);
+
+        var i1 = Letter("Accounts Manager", "Sample Survey Agency Pvt Ltd (SYNTHETIC)", "Invoice for field survey, phase 1", 6, InwardType.Invoice);
+        i1.Mode = "Courier"; i1.MarkToUserId = r1.UserId();
+        i1.Invoice = new InvoiceInput
+        {
+            VendorName = "Sample Survey Agency Pvt Ltd (SYNTHETIC)", VendorGstin = "27AAPFU0939F1ZV", IsMsme = true, MsmeClass = "Micro", UdyamNo = "UDYAM-MH-01-0001234",
+            InvoiceNo = "SSA/26-27/041", InvoiceDate = D(-50), ProjectCode = "NC-2026-014", Taxable = "1,00,000", Gst = "18,000", Total = "1,18,000", TermsDays = 30,
+        };
+        var inv1 = inward.Inward(i1, publisher, true);
+        AuditService.AmbientActor.Value = "approver1";
+        inward.Certify(inv1, D(-4), Rv(inv1), r1);
+        inward.SendToAccounts(inv1, Rv(inv1), r1);
+        AuditService.AmbientActor.Value = "approver2";
+        inward.RecordPayment(inv1, new PaymentInput { PaidOn = D(-2), Net = "50,000", Tds = "1,000", VoucherRef = "UTR-SYN-0001" }, Rv(inv1), r2);
+
+        AuditService.AmbientActor.Value = "publisher";
+        var i2 = Letter("Billing", "Sample Printers (SYNTHETIC)", "Invoice for printing of survey schedules", 1, InwardType.Invoice);
+        i2.Mode = "Hand"; i2.MarkToUserId = staffP.UserId();
+        i2.Invoice = new InvoiceInput { VendorName = "Sample Printers (SYNTHETIC)", InvoiceNo = "SP-778", InvoiceDate = D(-3), ProjectCode = "NC-2026-021", Total = "12,400", TermsDays = 15 };
+        inward.Inward(i2, publisher, true);
+    }
+}

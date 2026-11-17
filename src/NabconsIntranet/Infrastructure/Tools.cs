@@ -1,0 +1,130 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using NabconsIntranet.Data;
+
+namespace NabconsIntranet.Infrastructure;
+
+/// <summary>Command-line maintenance tools used by the .bat files in the release folder.</summary>
+public static class Tools
+{
+    public static int Run(string[] args, string contentRoot)
+    {
+        var config = new ConfigurationBuilder()
+            .SetBasePath(contentRoot)
+            .AddJsonFile("appsettings.json", optional: true)
+            .Build();
+        var o = config.GetSection("Intranet").Get<IntranetOptions>() ?? new IntranetOptions();
+        o.Resolve(contentRoot);
+        var db = new Db(o);
+        var accessor = new HttpContextAccessor();
+        var audit = new AuditService(db, accessor, NullLogger<AuditService>.Instance);
+
+        switch (args[0].ToLowerInvariant())
+        {
+            case "--restore":
+            {
+                if (args.Length < 2) { Console.WriteLine("Usage: NabconsIntranet.exe --restore <path-to-backup.zip>"); return 1; }
+                int rc;
+                try { rc = BackupService.Restore(o, args[1].Trim('"'), Console.Out); }
+                catch (IOException ex)
+                {
+                    Console.WriteLine("Restore could not move the current data: " + ex.Message);
+                    Console.WriteLine("The intranet is probably still running. Close its window (or run Stop-Service.bat) and try again.");
+                    return 6;
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    Console.WriteLine("Access denied: " + ex.Message + "\nRun this as a user who can write to the application folder.");
+                    return 7;
+                }
+                if (rc == 0)
+                {
+                    db.Initialize();
+                    audit.Log("Backup.Restored", "Backup", Path.GetFileName(args[1]), "Restored from command line", Environment.UserDomainName + "\\" + Environment.UserName);
+                }
+                return rc;
+            }
+            case "--backup":
+            {
+                db.Initialize();
+                var b = new BackupService(o, NullLogger<BackupService>.Instance).Create(audit, Environment.UserDomainName + "\\" + Environment.UserName + " (command line)");
+                Console.WriteLine($"Backup created: {b.FullPath}\nSHA-256: {b.Sha256}");
+                return 0;
+            }
+            case "--reset-admin-password":
+            {
+                db.Initialize();
+                var users = new UserRepository(db);
+                var admin = users.GetByUsername("admin");
+                if (admin == null)
+                {
+                    var id = users.Create(new AppUser { Username = "admin", DisplayName = "System Administrator", Roles = "Staff,Administrator" }, "command line");
+                    admin = users.Get(id)!;
+                }
+                admin.IsActive = true;
+                admin.Roles = Roles.Join(admin.RoleList.Append(Roles.Administrator));
+                users.Update(admin, "command line", rotateStamp: true);
+                users.SetPassword(admin.Id, o.InitialAdminPassword, mustChange: true, "command line");
+                audit.Log("User.PasswordReset", "User", admin.Id, "Administrator password reset from the server console", Environment.UserDomainName + "\\" + Environment.UserName);
+                Console.WriteLine($"User 'admin' is active, has the Administrator role and its password is now the InitialAdminPassword from appsettings.json.\nIt must be changed at next sign-in.");
+                return 0;
+            }
+            case "--migrate":
+            {
+                // Explicit upgrade step for the live machine: full backup ZIP first, then apply database changes.
+                Console.WriteLine("Taking a full backup before upgrading the database ...");
+                var exists = File.Exists(o.DatabasePath);
+                if (exists)
+                {
+                    var b = new BackupService(o, NullLogger<BackupService>.Instance).Create(audit, Environment.UserDomainName + "\\" + Environment.UserName + " (pre-migration)");
+                    Console.WriteLine($"Backup: {b.FullPath}");
+                }
+                var steps = db.Initialize();
+                foreach (var s in steps)
+                {
+                    Console.WriteLine(s);
+                    audit.Log(s.StartsWith("Note:", StringComparison.Ordinal) ? "System.SchemaNewer" : "System.Upgraded", "Database", Schema.Version, s, Environment.UserDomainName + "\\" + Environment.UserName + " (command line)");
+                }
+                Console.WriteLine(steps.Count == 0 ? $"Database already up to date (schema version {Schema.Version}). Nothing changed." : $"Database is now at schema version {Schema.Version}.");
+                return 0;
+            }
+            case "--grant-compliance-admin":
+            {
+                // Creates the first Compliance Admin, or recovers when every Compliance Admin has left (DD-07 D12).
+                if (args.Length < 2) { Console.WriteLine("Usage: NabconsIntranet.exe --grant-compliance-admin <user name>"); return 1; }
+                db.Initialize();
+                var users = new UserRepository(db);
+                var u = users.GetByUsername(args[1].Trim());
+                if (u == null || !u.IsActive) { Console.WriteLine($"No active user '{args[1]}'. In Windows mode the person must sign in to the intranet once first."); return 2; }
+                var co = config.GetSection("Compliance").Get<ComplianceOptions>() ?? new ComplianceOptions();
+                co.Resolve();
+                var fmt = new Fmt(o);
+                var tracker = new ChangeTracker();
+                var access = new ComplianceAccess(db, co);
+                var workflow = new ComplianceWorkflow(db, access, new ComplianceRepository(db, access, co, fmt), co, new MasterRepository(db), audit,
+                    new NotificationService(db, tracker), tracker, fmt, NullLogger<ComplianceWorkflow>.Instance);
+                workflow.GrantCore(u.Id, ComplianceGrant.Admin, "system (command line: " + Environment.UserName + ")");
+                Console.WriteLine($"{u.DisplayName} ({u.Username}) is now a Compliance Admin. Existing Compliance Admins have been notified.");
+                return 0;
+            }
+            case "--verify-audit":
+            {
+                db.Initialize();
+                var (ok, count, broken) = audit.Verify();
+                Console.WriteLine(ok ? $"Audit log intact: {count} entries verified." : $"AUDIT LOG BROKEN at entry {broken} (after {count} valid entries).");
+                return ok ? 0 : 5;
+            }
+            default:
+                Console.WriteLine("""
+                    NABCONS Intranet maintenance commands (stop the intranet first):
+                      NabconsIntranet.exe                         start the intranet
+                      NabconsIntranet.exe --backup                create a backup ZIP now
+                      NabconsIntranet.exe --restore <file.zip>    restore a backup ZIP
+                      NabconsIntranet.exe --reset-admin-password  re-enable 'admin' with the InitialAdminPassword
+                      NabconsIntranet.exe --verify-audit          check the audit log hash chain
+                      NabconsIntranet.exe --migrate               back up, then bring the database up to date (safe to repeat)
+                      NabconsIntranet.exe --grant-compliance-admin <user>   make a user a Compliance Admin (first one, or recovery)
+                    """);
+                return 1;
+        }
+    }
+}

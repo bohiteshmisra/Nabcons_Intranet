@@ -1,0 +1,274 @@
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.Negotiate;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http.Features;
+using NabconsIntranet.Data;
+using NabconsIntranet.Infrastructure;
+
+var contentRoot = AppContext.BaseDirectory;
+
+// ---------------------------------------------------------------------------
+// Command-line maintenance tools (run while the intranet is stopped):
+//   NabconsIntranet.exe --restore <backup.zip>
+//   NabconsIntranet.exe --backup
+//   NabconsIntranet.exe --reset-admin-password
+// ---------------------------------------------------------------------------
+if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal) && !args[0].StartsWith("--urls", StringComparison.OrdinalIgnoreCase)
+    && !args[0].StartsWith("--environment", StringComparison.OrdinalIgnoreCase) && !args[0].StartsWith("--contentRoot", StringComparison.OrdinalIgnoreCase))
+{
+    return Tools.Run(args, contentRoot);
+}
+
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    Args = args,
+    ContentRootPath = contentRoot,
+});
+
+builder.Host.UseWindowsService(o => o.ServiceName = "NABCONSIntranet");
+
+var options = builder.Configuration.GetSection("Intranet").Get<IntranetOptions>() ?? new IntranetOptions();
+options.Resolve(builder.Environment.ContentRootPath);
+builder.Services.AddSingleton(options);
+var notificationOptions = builder.Configuration.GetSection("Notifications").Get<NotificationOptions>() ?? new NotificationOptions();
+builder.Services.AddSingleton(notificationOptions);
+var enoteOptions = builder.Configuration.GetSection("ENote").Get<ENoteOptions>() ?? new ENoteOptions();
+enoteOptions.Resolve();
+builder.Services.AddSingleton(enoteOptions);
+var boardOptions = builder.Configuration.GetSection("MessageBoard").Get<BoardOptions>() ?? new BoardOptions();
+builder.Services.AddSingleton(boardOptions);
+var complianceOptions = builder.Configuration.GetSection("Compliance").Get<ComplianceOptions>() ?? new ComplianceOptions();
+complianceOptions.Resolve();
+builder.Services.AddSingleton(complianceOptions);
+var inwardOptions = builder.Configuration.GetSection("Inward").Get<InwardOptions>() ?? new InwardOptions();
+inwardOptions.Resolve();
+builder.Services.AddSingleton(inwardOptions);
+// One request may carry several attachments: allow the larger of the circular and e-Note limits.
+var maxBody = Math.Max(Math.Max(options.MaxUploadBytes * 5, enoteOptions.MaxFileBytes * 10), boardOptions.MaxPhotoMB * 1024L * 1024L * boardOptions.MaxPhotosPerPost) + 1024 * 1024;
+builder.Logging.AddProvider(new FileLoggerProvider(options.LogPath));
+
+builder.WebHost.ConfigureKestrel(k =>
+{
+    k.AddServerHeader = false;
+    k.Limits.MaxRequestBodySize = maxBody;
+});
+builder.Services.Configure<FormOptions>(f =>
+{
+    f.MultipartBodyLengthLimit = maxBody;
+    // keep request bodies up to just over 2 MB in memory: the compliance CSV import (max 2 MB) must never touch the disk
+    f.MemoryBufferThreshold = (int)UploadGuard.ImportBodyLimit + 128 * 1024;
+    f.ValueCountLimit = 2048;
+});
+
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddSingleton<Db>();
+builder.Services.AddSingleton<Fmt>();
+builder.Services.AddSingleton<AuditService>();
+builder.Services.AddSingleton<FileStore>();
+builder.Services.AddSingleton<BackupService>();
+builder.Services.AddSingleton<UserRepository>();
+builder.Services.AddSingleton<MasterRepository>();
+builder.Services.AddSingleton<StaffRepository>();
+builder.Services.AddSingleton<CircularRepository>();
+builder.Services.AddSingleton<NoticeRepository>();
+builder.Services.AddSingleton<RequestWorkflow>();
+builder.Services.AddSingleton<RegistrationRepository>();
+builder.Services.AddSingleton<ProfileRepository>();
+builder.Services.AddSingleton<PhotoService>();
+builder.Services.AddSingleton<LeadAccess>();
+builder.Services.AddSingleton<LeadRepository>();
+builder.Services.AddSingleton<ChangeTracker>();
+builder.Services.AddSingleton<INotificationService, NotificationService>();
+builder.Services.AddSingleton<DeskService>();
+builder.Services.AddSingleton<HousekeepingService>();
+builder.Services.AddSingleton<ENoteRepository>();
+builder.Services.AddSingleton<ENoteWorkflow>();
+builder.Services.AddSingleton<ENotePdfService>();
+builder.Services.AddSingleton<BoardRepository>();
+builder.Services.AddSingleton<ComplianceAccess>();
+builder.Services.AddSingleton<ComplianceRepository>();
+builder.Services.AddSingleton<ComplianceWorkflow>();
+builder.Services.AddSingleton<ComplianceImport>();
+builder.Services.AddSingleton<AtrBuilder>();
+builder.Services.AddHostedService<ComplianceScheduler>();
+builder.Services.AddSingleton<InwardAccess>();
+builder.Services.AddSingleton<InwardRepository>();
+builder.Services.AddSingleton<InwardWorkflow>();
+builder.Services.AddSingleton<InwardReports>();
+builder.Services.AddHostedService<InwardScheduler>();
+builder.Services.AddTransient<Seeder>();
+builder.Services.AddHostedService<BackupScheduler>();
+
+if (options.IsWindowsAuth)
+{
+    builder.Services.AddAuthentication(NegotiateDefaults.AuthenticationScheme).AddNegotiate();
+    builder.Services.AddTransient<Microsoft.AspNetCore.Authentication.IClaimsTransformation, WindowsRoleTransformation>();
+}
+else
+{
+    builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(c =>
+    {
+        c.LoginPath = "/Account/Login";
+        c.LogoutPath = "/Account/Logout";
+        c.AccessDeniedPath = "/Account/AccessDenied";
+        c.ExpireTimeSpan = TimeSpan.FromMinutes(options.SessionTimeoutMinutes);
+        c.SlidingExpiration = true;
+        c.Cookie.Name = "NABCONS.Auth";
+        c.Cookie.HttpOnly = true;
+        c.Cookie.SameSite = SameSiteMode.Strict;
+        c.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+        c.Events.OnValidatePrincipal = IdentityBuilder.ValidateCookie;
+        // The badge poll must never keep a session alive: the 30-minute idle timeout counts real use only.
+        c.Events.OnCheckSlidingExpiration = ctx =>
+        {
+            if (Endpoints.IsPoll(ctx.HttpContext.Request)) ctx.ShouldRenew = false;
+            return Task.CompletedTask;
+        };
+        // Small JSON endpoints answer 401/403 instead of redirecting to the sign-in page.
+        c.Events.OnRedirectToLogin = ctx =>
+        {
+            if (Endpoints.IsApi(ctx.Request)) ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            else ctx.Response.Redirect(ctx.RedirectUri);
+            return Task.CompletedTask;
+        };
+        c.Events.OnRedirectToAccessDenied = ctx =>
+        {
+            if (Endpoints.IsApi(ctx.Request)) ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+            else ctx.Response.Redirect(ctx.RedirectUri);
+            return Task.CompletedTask;
+        };
+    });
+}
+
+builder.Services.AddAuthorization(a =>
+{
+    // Everything requires a signed-in, active intranet user unless a page explicitly allows anonymous access.
+    a.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().RequireClaim(ClaimNames.UserId).Build();
+    // Endpoints marked .RequireAuthorization() use the default policy: make it the same, so a Windows user who is
+    // authenticated but not admitted (no intranet user id, e.g. deactivated) is refused there too.
+    a.DefaultPolicy = a.FallbackPolicy;
+    a.AddPolicy(Policies.Publisher, p => p.RequireClaim(ClaimNames.UserId).RequireRole(Roles.Publisher, Roles.Administrator));
+    a.AddPolicy(Policies.Approver, p => p.RequireClaim(ClaimNames.UserId).RequireRole(Roles.Approver));
+    a.AddPolicy(Policies.Admin, p => p.RequireClaim(ClaimNames.UserId).RequireRole(Roles.Administrator));
+    a.AddPolicy(Policies.AuditView, p => p.RequireClaim(ClaimNames.UserId).RequireRole(Roles.Auditor, Roles.Administrator));
+});
+
+builder.Services.AddAntiforgery(a =>
+{
+    a.Cookie.Name = "NABCONS.AF";
+    a.Cookie.SameSite = SameSiteMode.Strict;
+    a.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+});
+
+builder.Services.AddRazorPages(o =>
+{
+    o.Conventions.AuthorizeFolder("/Admin", Policies.Admin);
+    o.Conventions.AuthorizeFolder("/Audit", Policies.AuditView);
+    o.Conventions.AuthorizePage("/Circulars/Edit", Policies.Publisher);
+    o.Conventions.AuthorizePage("/Notices/Index", Policies.Publisher);
+    o.Conventions.AuthorizePage("/Requests/Inbox", Policies.Approver);
+    o.Conventions.AuthorizePage("/ENotes/Register", Policies.AuditView);   // metadata only (Administrators and Auditors)
+    // Business Leads pages check permissions themselves (BDU vertical / LeadViewer role / own leads).
+    o.Conventions.AllowAnonymousToPage("/Account/Login");
+    o.Conventions.AllowAnonymousToPage("/Account/Register");
+    o.Conventions.AllowAnonymousToPage("/Account/AccessDenied");
+    o.Conventions.AllowAnonymousToPage("/Error");
+});
+
+var app = builder.Build();
+
+// --- first run: create the database, administrator and (optionally) demo data ---
+foreach (var step in app.Services.GetRequiredService<Db>().Initialize())
+{
+    app.Logger.LogWarning("{Step}", step);
+    app.Services.GetRequiredService<AuditService>().Log(step.StartsWith("Note:", StringComparison.Ordinal) ? "System.SchemaNewer" : "System.Upgraded",
+        "Database", Schema.Version, step, "system");
+}
+app.Services.GetRequiredService<Seeder>().Run();
+app.Services.GetRequiredService<ProfileRepository>().LinkUnlinkedAccounts();
+{
+    var housekeeping = app.Services.GetRequiredService<HousekeepingService>();
+    var enoteWorkflow = app.Services.GetRequiredService<ENoteWorkflow>();
+    if (enoteOptions.Enabled) housekeeping.ExtraSteps.Add(enoteWorkflow.AgeingAlerts);
+}
+foreach (var unknown in complianceOptions.UnknownRestricted)
+    app.Logger.LogWarning("Compliance:RestrictedSourceTypes contains an unknown code '{Code}'; it is ignored.", unknown);
+app.Services.GetRequiredService<AuditService>().Log("System.Started", "System", null,
+    $"NABCONS Intranet {typeof(Program).Assembly.GetName().Version} started; auth={options.AuthenticationMode}", "system");
+
+app.UseExceptionHandler("/Error");
+app.UseStatusCodePagesWithReExecute("/Error", "?code={0}");
+
+app.Use(async (ctx, next) =>
+{
+    var h = ctx.Response.Headers;
+    h["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; " +
+                                    "connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'; object-src 'none'";
+    h["X-Content-Type-Options"] = "nosniff";
+    h["X-Frame-Options"] = "DENY";
+    h["Referrer-Policy"] = "no-referrer";
+    h["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
+    h["Cache-Control"] = "no-cache, no-store";
+    h["Pragma"] = "no-cache";
+    await next();
+});
+app.UseUploadGuard();
+
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = s => s.Context.Response.Headers["Cache-Control"] = "public, max-age=3600",
+});
+app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Local accounts that must change their password are held on the change-password page.
+app.Use(async (ctx, next) =>
+{
+    if (ctx.User.HasClaim(ClaimNames.MustChangePassword, "1")
+        && !ctx.Request.Path.StartsWithSegments("/Account")
+        && !ctx.Request.Path.StartsWithSegments("/css") && !ctx.Request.Path.StartsWithSegments("/js") && !ctx.Request.Path.StartsWithSegments("/img"))
+    {
+        ctx.Response.Redirect("/Account/ChangePassword");
+        return;
+    }
+    await next();
+});
+
+app.MapRazorPages();
+app.MapIntranetEndpoints();
+
+if (!Microsoft.Extensions.Hosting.WindowsServices.WindowsServiceHelpers.IsWindowsService())
+{
+    var port = new Uri((builder.Configuration["Urls"] ?? "http://0.0.0.0:8080").Split(';')[0].Replace("0.0.0.0", "localhost").Replace("*", "localhost").Replace("+", "localhost")).Port;
+    var ips = System.Net.Dns.GetHostAddresses(System.Net.Dns.GetHostName())
+        .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(a)).Select(a => a.ToString()).ToList();
+    Console.WriteLine();
+    Console.WriteLine("  ==============================================================");
+    Console.WriteLine($"   {options.SiteTitle} is running.  KEEP THIS WINDOW OPEN.");
+    var suffix = port == 80 ? "" : ":" + port;
+    Console.WriteLine($"   On this PC:         http://localhost{suffix}");
+    Console.WriteLine($"   From other LAN PCs: http://{Environment.MachineName.ToLowerInvariant()}{suffix}");
+    foreach (var ip in ips) Console.WriteLine($"                       http://{ip}{suffix}");
+    Console.WriteLine("   To stop: close this window or press Ctrl+C.");
+    Console.WriteLine("  ==============================================================");
+    Console.WriteLine();
+}
+app.Logger.LogInformation("NABCONS Intranet listening on {Urls}. Data folder: {Data}", string.Join(", ", app.Urls), options.DataPath);
+try
+{
+    app.Run();
+}
+catch (IOException ex) when (ex.InnerException is System.Net.Sockets.SocketException || ex.Message.Contains("address already in use", StringComparison.OrdinalIgnoreCase))
+{
+    Console.Error.WriteLine();
+    Console.Error.WriteLine("The intranet could not start because its network port is already in use.");
+    Console.Error.WriteLine("It is probably already running (check for another window, or the Windows service).");
+    Console.Error.WriteLine("Another program may also be using the port; ask IT, or change \"Urls\" in appsettings.json");
+    Console.Error.WriteLine("to another approved port, e.g. http://0.0.0.0:8081");
+    Console.Error.WriteLine("Details: " + ex.Message);
+    return 10;
+}
+return 0;
+
+public partial class Program;
